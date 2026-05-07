@@ -6,16 +6,17 @@
 #
 # ─── Layout ───────────────────────────────────────────────────────────────────
 #   ─ imperStatusLine ─ skill: <output_style>
-#   TIME │ MODEL │ EFFORT │ COST
-#   ENV  │ SK │ Hooks │ Plugins │ CMD
+#   TIME │ MODEL │ EFFORT │ PERM
+#   ENV  │ Agents │ SK │ Hooks │ Plugins │ CMD
 #   ──────────────────────────────────
 #   ● CONTEXT bar (full width, gradient green→yellow→red)
 #   ──────────────────────────────────
-#   ⚡ USAGE 5H (only if ccusage cache is populated)
+#   🔢 TOKENS:  In │ Out │ Cached │ Total
+#   💰 SESSION: Cost │ Calls │ Uptime │ ↺Reset5h
 #   ──────────────────────────────────
 #   ◆ PWD │ Branch │ Age │ Mod │ Sync   (or "(not a git repo)")
 #   ──────────────────────────────────
-#   ◎ MEMORY: Files │ claude-mem │ Wiki │ Plugins
+#   ◎ MEMORY: Sessions │ claude-mem │ CC version
 #   ──────────────────────────────────
 #   ▸ TASKS: N bg │ N agent   (only if active)
 #
@@ -94,6 +95,16 @@ color_pct() {
     fi
 }
 
+# Helper: human-readable integer (1234 → "1.2K", 1234567 → "1.2M"). Pure bash, no bc.
+fmt_n() {
+    local n="${1:-0}"
+    case "$n" in ''|*[!0-9]*) printf '0'; return ;; esac
+    if   [ "$n" -ge 1000000 ]; then printf '%d.%dM' "$(( n / 1000000 ))" "$(( n % 1000000 / 100000 ))"
+    elif [ "$n" -ge 1000 ];    then printf '%d.%dK' "$(( n / 1000 ))"    "$(( n % 1000 / 100 ))"
+    else                            printf '%d' "$n"
+    fi
+}
+
 # Detect terminal width (fallback 100)
 TERM_COLS="${COLUMNS:-0}"
 [ "$TERM_COLS" -le 0 ] && TERM_COLS=$(tput cols 2>/dev/null || echo 100)
@@ -121,6 +132,15 @@ CWD="$(j '.workspace.current_dir // .cwd // ""')"
 CC_VERSION="$(j '.version // ""')"
 COST_USD="$(j '.cost.total_cost_usd // 0')"
 OUTPUT_STYLE="$(j '.output_style.name // "default"')"
+# Permission mode: try snake_case (Claude Code statusline JSON) and camelCase
+# (older payloads / what we see in transcript metadata). Fallback: "default".
+PERM_MODE="$(j '.permission_mode // .permissionMode // empty')"
+if [ -z "$PERM_MODE" ] && [ -f "$TRANSCRIPT" ]; then
+    # Last resort: read it from the transcript metadata (most recent line).
+    PERM_MODE=$(grep -ohE '"permissionMode":"[^"]*"' "$TRANSCRIPT" 2>/dev/null \
+        | tail -1 | sed 's/.*"permissionMode":"\([^"]*\)".*/\1/')
+fi
+[ -z "$PERM_MODE" ] && PERM_MODE="default"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # COUNTS — skills, hooks, commands, plugins (cached, mtime-based)
@@ -138,31 +158,57 @@ needs_refresh() {
 }
 
 if needs_refresh "$COUNTS_CACHE" "$COUNTS_TTL"; then
-    sk_count=$(find "$PLUGINS_DIR/marketplaces" -type d -name "skills" -maxdepth 6 2>/dev/null \
-        | xargs -I{} find {} -mindepth 1 -maxdepth 2 -name "SKILL.md" 2>/dev/null \
-        | wc -l | tr -d ' ')
-    [ -z "$sk_count" ] || [ "$sk_count" = "0" ] && sk_count=$(find "$PLUGINS_DIR/marketplaces" -type d -maxdepth 6 -name "skills" 2>/dev/null \
-        | xargs -I{} find {} -mindepth 1 -maxdepth 1 -type d 2>/dev/null \
-        | wc -l | tr -d ' ')
+    # Plugin count from installed_plugins.json:
+    #   v2 (current): { "version": 2, "plugins": { "<id>@<marketplace>": [...] } }
+    #   v1 (legacy):  flat object { "<id>": {...} }
+    plugin_count=$(jq -r '
+        if type=="object" and has("plugins") then (.plugins | keys | length)
+        elif type=="object" then (keys | length)
+        else length end
+    ' "$INSTALLED_PLUGINS" 2>/dev/null)
+    [ -z "$plugin_count" ] && plugin_count=0
 
-    cmd_count=$(find "$PLUGINS_DIR/marketplaces" -path "*/commands/*.md" 2>/dev/null \
-        | wc -l | tr -d ' ')
+    # Skills / Commands / Agents from each installed plugin's installPath.
+    # We deliberately do NOT scan ~/.claude/plugins/marketplaces (full registry
+    # clones — would count plugins you haven't installed) nor ~/.claude/plugins/cache
+    # at the top level (keeps multiple versions of the same plugin — would double-count).
+    sk_plug=0; cmd_plug=0; agent_plug=0
+    while IFS= read -r p; do
+        [ -z "$p" ] || [ ! -d "$p" ] && continue
+        s=$(find "$p" -path "*/skills/*/SKILL.md" 2>/dev/null | wc -l | tr -d ' ')
+        c=$(find "$p" -path "*/commands/*.md" 2>/dev/null | wc -l | tr -d ' ')
+        a=$(find "$p" -path "*/agents/*.md" 2>/dev/null | wc -l | tr -d ' ')
+        sk_plug=$(( sk_plug + ${s:-0} ))
+        cmd_plug=$(( cmd_plug + ${c:-0} ))
+        agent_plug=$(( agent_plug + ${a:-0} ))
+    done < <(jq -r '
+        if type=="object" and has("plugins") then
+            (.plugins | to_entries[] | .value[0].installPath // empty)
+        elif type=="object" then
+            (to_entries[] | .value.installPath // empty)
+        else empty end
+    ' "$INSTALLED_PLUGINS" 2>/dev/null)
+
+    # User-level skills/commands/agents (not part of any plugin)
+    sk_user=$(find "$HOME/.claude/skills" -name "SKILL.md" 2>/dev/null | wc -l | tr -d ' ')
     cmd_user=$(find "$HOME/.claude/commands" -maxdepth 3 -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
-    cmd_count=$(( ${cmd_count:-0} + ${cmd_user:-0} ))
+    agent_user=$(find "$HOME/.claude/agents" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
+
+    sk_count=$(( sk_plug + ${sk_user:-0} ))
+    cmd_count=$(( cmd_plug + ${cmd_user:-0} ))
+    agent_count=$(( agent_plug + ${agent_user:-0} ))
 
     hooks_count=$(jq -r '
         [(.hooks // {}) | to_entries[] | .value | if type=="array" then .[] else . end | (.hooks // []) | length] | add // 0
     ' "$SETTINGS_FILE" 2>/dev/null)
     [ -z "$hooks_count" ] && hooks_count=0
 
-    plugin_count=$(jq -r 'if type=="object" then (keys | length) else length end' "$INSTALLED_PLUGINS" 2>/dev/null)
-    [ -z "$plugin_count" ] && plugin_count=0
-
     {
         echo "SK_COUNT=${sk_count:-0}"
         echo "CMD_COUNT=${cmd_count:-0}"
         echo "HOOKS_COUNT=${hooks_count:-0}"
         echo "PLUGIN_COUNT=${plugin_count:-0}"
+        echo "AGENT_COUNT=${agent_count:-0}"
     } > "$COUNTS_CACHE"
 fi
 # shellcheck disable=SC1090
@@ -178,16 +224,89 @@ case "$MODEL_ID" in
 esac
 
 CTX_USED=0
+SES_IN=0; SES_OUT=0; SES_CACHED=0; SES_TOTAL=0
+SES_CALLS=0; SES_UPTIME_MIN=0
 if [ -f "$TRANSCRIPT" ]; then
-    # Use the latest "usage" entry from the transcript (Claude Code logs cumulative tokens).
-    # macOS lacks `tac`, so we use `tail -N` and process line-by-line with `inputs`.
-    CTX_USED=$(tail -200 "$TRANSCRIPT" 2>/dev/null | jq -rn '
-        [inputs | select(.message?.usage?) | .message.usage |
-            ((.input_tokens // 0) + (.cache_read_input_tokens // 0) + (.cache_creation_input_tokens // 0) + (.output_tokens // 0))
-        ] | if length > 0 then max else 0 end
-    ' 2>/dev/null)
-    [ -z "$CTX_USED" ] && CTX_USED=0
+    # Token metrics methodology (aligned with sirmalloc/ccstatusline):
+    #   * Streaming writes multiple JSONL entries per API call: intermediate ones
+    #     have stop_reason: null (partial chunks), the final one has a string
+    #     ("end_turn", "tool_use"). Counting all entries double-counts streams.
+    #     We sum only entries whose stop_reason is a string (finalized).
+    #   * Session totals (In / Out / Cached) are CUMULATIVE sums over the full
+    #     transcript — what you've spent so far this session, not the last call.
+    #   * Context length is the LAST main-chain entry's
+    #     (input + cache_read + cache_creation) — that's the live occupancy.
+    #
+    # The full transcript is parsed once, but cached on disk and only refreshed
+    # when the transcript file is newer than the cache (mtime-based).
+    TR_HASH=$(printf '%s' "$TRANSCRIPT" | shasum 2>/dev/null | awk '{print $1}')
+    TOKENS_CACHE="$CACHE_DIR/tokens-${TR_HASH}.sh"
+    if [ ! -f "$TOKENS_CACHE" ] || [ "$TRANSCRIPT" -nt "$TOKENS_CACHE" ]; then
+        read -r _ctx _in _out _cached _total _calls _first_ts _last_ts < <(
+            jq -rs '
+                [.[] | select(.message?.usage? and (.message.stop_reason | type == "string"))] as $f
+                | (([$f[] | .message.usage.input_tokens // 0] | add) // 0) as $in
+                | (([$f[] | .message.usage.output_tokens // 0] | add) // 0) as $out
+                | (([$f[] | (.message.usage.cache_read_input_tokens // 0)
+                          + (.message.usage.cache_creation_input_tokens // 0)] | add) // 0) as $cached
+                | (
+                    # last main-chain (non-sidechain, non-error) finalized entry
+                    [$f[] | select((.isSidechain // false) | not)
+                          | select((.isApiErrorMessage // false) | not)] | last
+                  ) as $lastMain
+                | (
+                    if $lastMain then
+                        ($lastMain.message.usage.input_tokens // 0)
+                        + ($lastMain.message.usage.cache_read_input_tokens // 0)
+                        + ($lastMain.message.usage.cache_creation_input_tokens // 0)
+                    else 0 end
+                  ) as $ctx
+                # Session uptime: first and last timestamp across the WHOLE
+                # transcript (any line with .timestamp), not just usage entries.
+                | ([.[] | .timestamp // empty]) as $allts
+                | ($allts | first // "") as $tfirst
+                | ($allts | last // "") as $tlast
+                | "\($ctx) \($in) \($out) \($cached) \($in + $out + $cached) \($f | length) \($tfirst) \($tlast)"
+            ' "$TRANSCRIPT" 2>/dev/null
+        )
+        # Derive uptime in minutes from the two ISO timestamps (portable: GNU `date -d`
+        # and BSD `date -j -f` differ — try both).
+        _uptime=0
+        if [ -n "$_first_ts" ] && [ -n "$_last_ts" ]; then
+            t1=$(date -j -f '%Y-%m-%dT%H:%M:%S' "${_first_ts%.*}" '+%s' 2>/dev/null \
+                || date -d "$_first_ts" '+%s' 2>/dev/null)
+            t2=$(date -j -f '%Y-%m-%dT%H:%M:%S' "${_last_ts%.*}" '+%s' 2>/dev/null \
+                || date -d "$_last_ts" '+%s' 2>/dev/null)
+            if [ -n "$t1" ] && [ -n "$t2" ] && [ "$t2" -gt "$t1" ]; then
+                _uptime=$(( (t2 - t1) / 60 ))
+            fi
+        fi
+        {
+            echo "CTX_USED=${_ctx:-0}"
+            echo "SES_IN=${_in:-0}"
+            echo "SES_OUT=${_out:-0}"
+            echo "SES_CACHED=${_cached:-0}"
+            echo "SES_TOTAL=${_total:-0}"
+            echo "SES_CALLS=${_calls:-0}"
+            echo "SES_UPTIME_MIN=${_uptime:-0}"
+        } > "$TOKENS_CACHE"
+    fi
+    # shellcheck disable=SC1090
+    source "$TOKENS_CACHE"
 fi
+: "${CTX_USED:=0}" "${SES_IN:=0}" "${SES_OUT:=0}" "${SES_CACHED:=0}" "${SES_TOTAL:=0}"
+: "${SES_CALLS:=0}" "${SES_UPTIME_MIN:=0}"
+
+# Uptime formatter: minutes → "Xh Ym" / "Ym" / "<1m"
+fmt_uptime() {
+    local m="${1:-0}"
+    case "$m" in ''|*[!0-9]*) printf '<1m'; return ;; esac
+    if [ "$m" -lt 1 ];   then printf '<1m'
+    elif [ "$m" -lt 60 ]; then printf '%dm' "$m"
+    elif [ $((m % 60)) -eq 0 ]; then printf '%dh' "$((m / 60))"
+    else printf '%dh %dm' "$((m / 60))" "$((m % 60))"
+    fi
+}
 
 CTX_PCT=$(( CTX_USED * 100 / CTX_MAX ))
 [ "$CTX_PCT" -gt 100 ] && CTX_PCT=100
@@ -267,62 +386,60 @@ esac
 # GIT info
 # ─────────────────────────────────────────────────────────────────────────────
 GIT_BRANCH=""; GIT_AGE=""; GIT_MOD=""; GIT_SYNC=""
-if [ -n "$CWD" ] && [ -d "$CWD" ]; then
-    cd "$CWD" 2>/dev/null
-    if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-        GIT_BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null || git rev-parse --short HEAD 2>/dev/null)
-        last_commit_ts=$(git log -1 --format=%ct 2>/dev/null)
-        if [ -n "$last_commit_ts" ]; then
-            now=$(date +%s)
-            diff=$(( now - last_commit_ts ))
-            if   [ "$diff" -lt 60 ];      then GIT_AGE="${diff}s"
-            elif [ "$diff" -lt 3600 ];    then GIT_AGE="$(( diff / 60 ))m"
-            elif [ "$diff" -lt 86400 ];   then GIT_AGE="$(( diff / 3600 ))h"
-            else                                GIT_AGE="$(( diff / 86400 ))d"
-            fi
+if [ -n "$CWD" ] && [ -d "$CWD" ] && git -C "$CWD" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    GIT_BRANCH=$(git -C "$CWD" symbolic-ref --short HEAD 2>/dev/null || git -C "$CWD" rev-parse --short HEAD 2>/dev/null)
+    last_commit_ts=$(git -C "$CWD" log -1 --format=%ct 2>/dev/null)
+    if [ -n "$last_commit_ts" ]; then
+        now=$(date +%s)
+        diff=$(( now - last_commit_ts ))
+        if   [ "$diff" -lt 60 ];      then GIT_AGE="${diff}s"
+        elif [ "$diff" -lt 3600 ];    then GIT_AGE="$(( diff / 60 ))m"
+        elif [ "$diff" -lt 86400 ];   then GIT_AGE="$(( diff / 3600 ))h"
+        else                                GIT_AGE="$(( diff / 86400 ))d"
         fi
-        GIT_MOD=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')
-        ahead_behind=$(git rev-list --left-right --count "@{upstream}...HEAD" 2>/dev/null)
-        if [ -n "$ahead_behind" ]; then
-            behind=$(echo "$ahead_behind" | awk '{print $1}')
-            ahead=$(echo "$ahead_behind" | awk '{print $2}')
-            sync=""
-            [ "$ahead" -gt 0 ] && sync="↑${ahead}"
-            [ "$behind" -gt 0 ] && sync="${sync}↓${behind}"
-            GIT_SYNC="${sync:-=}"
-        fi
+    fi
+    GIT_MOD=$(git -C "$CWD" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+    ahead_behind=$(git -C "$CWD" rev-list --left-right --count "@{upstream}...HEAD" 2>/dev/null)
+    if [ -n "$ahead_behind" ]; then
+        behind=$(echo "$ahead_behind" | awk '{print $1}')
+        ahead=$(echo "$ahead_behind" | awk '{print $2}')
+        sync=""
+        [ "$ahead" -gt 0 ] && sync="↑${ahead}"
+        [ "$behind" -gt 0 ] && sync="${sync}↓${behind}"
+        GIT_SYNC="${sync:-=}"
     fi
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MEMORY counts — proposta A: Files | claude-mem | Wiki | Plugins
 # ─────────────────────────────────────────────────────────────────────────────
-# Files: auto-memory dir for the *current* project (derived from cwd)
-MEM_PROJECT_KEY="$(echo "$CWD" | sed 's|/|-|g')"
-MEM_DIR="$HOME/.claude/projects/${MEM_PROJECT_KEY}/memory"
-MEM_FILES=$(find "$MEM_DIR" -type f -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
-# Fallback: count this project's transcripts as proxy for "session files"
-[ -z "$MEM_FILES" ] || [ "$MEM_FILES" = "0" ] && \
-    MEM_FILES=$(find "$HOME/.claude/projects/${MEM_PROJECT_KEY}" -maxdepth 1 -name "*.jsonl" 2>/dev/null | wc -l | tr -d ' ')
+# Sessions: count of Claude Code transcript files (.jsonl) for this project.
+# Claude Code normalizes the cwd into a project key by replacing every
+# non-alphanumeric character with a dash (e.g. "ugo.lattanzi" → "ugo-lattanzi"),
+# not just slashes — matching that behavior is required to find the right dir.
+MEM_PROJECT_KEY="$(echo "$CWD" | sed 's|[^a-zA-Z0-9]|-|g')"
+MEM_PROJECT_DIR="$HOME/.claude/projects/${MEM_PROJECT_KEY}"
+MEM_SESSIONS=$(find "$MEM_PROJECT_DIR" -maxdepth 1 -name "*.jsonl" 2>/dev/null | wc -l | tr -d ' ')
 
-# claude-mem observations: SQLite DB at ~/.claude-mem/claude-mem.db
-MEM_OBS=0
+# claude-mem observations: SQLite DB at ~/.claude-mem/claude-mem.db.
+# We pull two counts in one connection: the global total (across all projects)
+# and the count for THIS project, where claude-mem identifies projects by the
+# cwd basename (e.g. "imperugo", "moresi-agent-framework"). The local count is
+# 0 if claude-mem hasn't observed this project yet.
+MEM_OBS=0; MEM_OBS_LOCAL=0
 if [ -f "$HOME/.claude-mem/claude-mem.db" ] && command -v sqlite3 >/dev/null 2>&1; then
-    MEM_OBS=$(sqlite3 "$HOME/.claude-mem/claude-mem.db" "SELECT COUNT(*) FROM observations" 2>/dev/null)
+    PROJ_BASE="${CWD##*/}"
+    # Escape single quotes for SQL literal safety (' → '')
+    PROJ_BASE_SQL="${PROJ_BASE//\'/\'\'}"
+    read -r MEM_OBS MEM_OBS_LOCAL < <(
+        sqlite3 -separator ' ' "$HOME/.claude-mem/claude-mem.db" \
+            "SELECT (SELECT COUNT(*) FROM observations), (SELECT COUNT(*) FROM observations WHERE project = '${PROJ_BASE_SQL}')" 2>/dev/null
+    )
 fi
 
-# Wiki articles: prefer project-local wiki (relative to cwd), fallback to ~/wiki
-WIKI_COUNT=0
-for wiki_root in "$CWD/wiki" "$HOME/wiki"; do
-    if [ -d "$wiki_root" ]; then
-        WIKI_COUNT=$(find "$wiki_root" -name "*.md" -type f 2>/dev/null | wc -l | tr -d ' ')
-        break
-    fi
-done
-
-MEM_FILES=${MEM_FILES:-0}
+MEM_SESSIONS=${MEM_SESSIONS:-0}
 MEM_OBS=${MEM_OBS:-0}
-WIKI_COUNT=${WIKI_COUNT:-0}
+MEM_OBS_LOCAL=${MEM_OBS_LOCAL:-0}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TASKS — count active background tasks/agents from transcript (cached 3s)
@@ -385,6 +502,15 @@ if [ "$USAGE_5H_PCT" != "--" ]; then
     USAGE_COLOR=$(color_pct "$USAGE_5H_PCT")
 fi
 
+# Permission mode → short label + color (red for bypass = "be careful")
+case "$PERM_MODE" in
+    bypassPermissions) PERM_SHORT="bypass";       PERM_COLOR="$C_RED" ;;
+    acceptEdits)       PERM_SHORT="accept";       PERM_COLOR="$C_YELLOW" ;;
+    plan)              PERM_SHORT="plan";         PERM_COLOR="$C_PURPLE" ;;
+    default|"")        PERM_SHORT="default";      PERM_COLOR="$C_GREEN" ;;
+    *)                 PERM_SHORT="$PERM_MODE";   PERM_COLOR="$C_VALUE_DIM" ;;
+esac
+
 # ─────────────────────────────────────────────────────────────────────────────
 # RENDER
 # ─────────────────────────────────────────────────────────────────────────────
@@ -396,20 +522,25 @@ printf '%b─%b %bimper%bStatus%bLine%b %b─%b ' \
     "$C_LINE" "$R"
 printf '%bskill: %b%s%b\n' "$C_VALUE_DIM" "$C_PURPLE" "$ACTIVE_SKILL" "$R"
 
-# Row 1: time | model | effort | cost (no emoji — keeps column alignment with row 2)
-printf '%bTIME:%b %s   %b│%b   %bMODEL:%b %b%s%b   %b│%b   %bEFFORT:%b %b%s%b   %b│%b   %bCOST:%b %b%s%b\n' \
+# Row 1: time | model | effort | perm  (cost moved to SESSION row)
+printf '%bTIME:%b %s   %b│%b   %bMODEL:%b %b%s%b   %b│%b   %bEFFORT:%b %b%s%b   %b│%b   %bPERM:%b %b%s%b\n' \
     "$C_LABEL" "$R" "$NOW" \
     "$C_SEP" "$R" \
     "$C_LABEL" "$R" "$C_VALUE" "$MODEL_SHORT" "$R" \
     "$C_SEP" "$R" \
     "$C_LABEL" "$R" "$EFFORT_COLOR" "$EFFORT" "$R" \
     "$C_SEP" "$R" \
-    "$C_LABEL" "$R" "$C_GREEN" "$COST_FMT" "$R"
+    "$C_LABEL" "$R" "$PERM_COLOR" "$PERM_SHORT" "$R"
 
-# Row 2: ENV / counts
-printf '%bENV: %b CC %b%s%b   %b│%b   SK %b%s%b   %b│%b   Hooks %b%s%b   %b│%b   Plugins %b%s%b   %b│%b   CMD %b%s%b\n' \
+# Row 2: ENV / counts. Agents lives here (active count appended in parens
+# when there are sub-agents currently running, e.g. "43 (4 active)").
+agents_env="${AGENT_COUNT:-0}"
+if [ "${TASKS_AGENT:-0}" -gt 0 ]; then
+    agents_env="${AGENT_COUNT:-0} (${TASKS_AGENT} active)"
+fi
+printf '%bENV: %b Agents %b%s%b   %b│%b   SK %b%s%b   %b│%b   Hooks %b%s%b   %b│%b   Plugins %b%s%b   %b│%b   CMD %b%s%b\n' \
     "$C_LABEL" "$R" \
-    "$C_VALUE" "$CC_VERSION" "$R" \
+    "$C_VALUE" "$agents_env" "$R" \
     "$C_SEP" "$R" "$C_VALUE" "$SK_COUNT" "$R" \
     "$C_SEP" "$R" "$C_VALUE" "$HOOKS_COUNT" "$R" \
     "$C_SEP" "$R" "$C_VALUE" "$PLUGIN_COUNT" "$R" \
@@ -424,11 +555,28 @@ printf '  %b%s%%%b\n' "$CTX_COLOR" "$CTX_PCT" "$R"
 
 sep
 
-# Row 4: USAGE (5H quota — only if available)
-if [ "$USAGE_5H_PCT" != "--" ]; then
-    printf '%b⚡%b %bUSAGE:%b 5H %b%s%%%b' \
-        "$C_YELLOW" "$R" "$C_LABEL" "$R" "$USAGE_COLOR" "$USAGE_5H_PCT" "$R"
-    [ -n "$USAGE_5H_RESET" ] && printf '   %b↺%s%b' "$C_VALUE_DIM" "$USAGE_5H_RESET" "$R"
+# Row 3b: TOKENS — cumulative session token breakdown
+#   In     = NEW input tokens spent this session (small with prompt cache)
+#   Out    = tokens generated by the model
+#   Cached = cache_read + cache_creation (the bulk on long sessions)
+#   Total  = In + Out + Cached
+if [ "$SES_TOTAL" -gt 0 ]; then
+    printf '%b🔢 TOKENS:%b In %b%s%b   %b│%b   Out %b%s%b   %b│%b   Cached %b%s%b   %b│%b   Total %b%s%b\n' \
+        "$C_LABEL" "$R" \
+        "$C_VALUE" "$(fmt_n "$SES_IN")" "$R" \
+        "$C_SEP" "$R" "$C_VALUE" "$(fmt_n "$SES_OUT")" "$R" \
+        "$C_SEP" "$R" "$C_GREEN" "$(fmt_n "$SES_CACHED")" "$R" \
+        "$C_SEP" "$R" "$C_VALUE" "$(fmt_n "$SES_TOTAL")" "$R"
+
+    # Row 3c: SESSION meta — cost, calls, uptime, next 5h reset
+    printf '%b💰 SESSION:%b Cost %b%s%b   %b│%b   Calls %b%s%b   %b│%b   Uptime %b%s%b' \
+        "$C_LABEL" "$R" \
+        "$C_GREEN" "$COST_FMT" "$R" \
+        "$C_SEP" "$R" "$C_VALUE" "$SES_CALLS" "$R" \
+        "$C_SEP" "$R" "$C_VALUE" "$(fmt_uptime "$SES_UPTIME_MIN")" "$R"
+    if [ -n "$USAGE_5H_RESET" ]; then
+        printf '   %b│%b   %b↺%s%b' "$C_SEP" "$R" "$C_VALUE_DIM" "$USAGE_5H_RESET" "$R"
+    fi
     printf '\n'
     sep
 fi
@@ -449,13 +597,21 @@ printf '\n'
 
 sep
 
-# Row 6: MEMORY
-printf '%b◎ MEMORY:%b 📁 %b%s%b %bFiles%b   %b│%b   🧠 %b%s%b %bclaude-mem%b   %b│%b   📚 %b%s%b %bWiki%b   %b│%b   🔌 %b%s%b %bPlugins%b\n' \
+# Row 6: MEMORY. Agents lives in the ENV row now (alongside SK/Hooks/Plugins/CMD);
+# the CC version takes its slot here so the row keeps three balanced columns.
+# Units: Sessions = .jsonl transcript files for this project; obs = rows in
+# claude-mem SQLite DB shown as "local / total" when local > 0; CC = Claude
+# Code CLI version.
+if [ "$MEM_OBS_LOCAL" -gt 0 ]; then
+    obs_display="$MEM_OBS_LOCAL / $(fmt_n "$MEM_OBS")"
+else
+    obs_display="$MEM_OBS"
+fi
+printf '%b◎ MEMORY:%b 💬 %b%s%b %bSessions%b   %b│%b   🧠 %b%s%b %bobs%b %b(claude-mem)%b   %b│%b   🟧 %bCC%b %b%s%b\n' \
     "$C_LABEL" "$R" \
-    "$C_VALUE" "$MEM_FILES" "$R" "$C_PURPLE" "$R" \
-    "$C_SEP" "$R" "$C_VALUE" "$MEM_OBS" "$R" "$C_PURPLE" "$R" \
-    "$C_SEP" "$R" "$C_VALUE" "$WIKI_COUNT" "$R" "$C_PURPLE" "$R" \
-    "$C_SEP" "$R" "$C_VALUE" "$PLUGIN_COUNT" "$R" "$C_PURPLE" "$R"
+    "$C_VALUE" "$MEM_SESSIONS" "$R" "$C_PURPLE" "$R" \
+    "$C_SEP" "$R" "$C_VALUE" "$obs_display" "$R" "$C_PURPLE" "$R" "$C_VALUE_DIM" "$R" \
+    "$C_SEP" "$R" "$C_PURPLE" "$R" "$C_VALUE" "$CC_VERSION" "$R"
 
 # Row 7: TASKS (only if any active)
 if [ "$TASKS_BG" -gt 0 ] || [ "$TASKS_AGENT" -gt 0 ]; then
