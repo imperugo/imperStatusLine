@@ -87,7 +87,6 @@ fi
 echo "Installing imperStatusLine…"
 [ -f "$SRC" ] || die "source $SRC not found — run this from the cloned repo, or alongside $SCRIPT_NAME"
 have jq || warn "jq not found in PATH — required at runtime; install with 'brew install jq' (macOS) or your package manager"
-have sqlite3 || info "sqlite3 not found — claude-mem 'obs' counter will show 0 (optional)"
 
 mkdir -p "$CLAUDE_DIR"
 

@@ -7,7 +7,7 @@ A custom status line for [Claude Code](https://docs.claude.com/en/docs/claude-co
 ## What you see
 
 ```
-─ imperStatusLine ─ skill: <output_style>
+─ imperStatusLine ─ style: <output_style>      (or  agent: <name>  in --agent)
 TIME: 08:51   │   MODEL: Opus (1M)   │   EFFORT: high   │   PERM: bypass
 ENV:  Agents 43   │   SK 162   │   Hooks 2   │   Plugins 29   │   CMD 44
 ──────────────────────────────────────────────────────────────────────────
@@ -18,8 +18,6 @@ ENV:  Agents 43   │   SK 162   │   Hooks 2   │   Plugins 29   │   CMD 44
 📊 QUOTA:   5h 34% ↺12:00   │   7d 12% ↺Jun 06
 ──────────────────────────────────────────────────────────────────────────
 ◆ PWD: brand-kit   │   Branch: main   │   Age: 2h   │   Mod: 42   │   PR: #128 ✓
-──────────────────────────────────────────────────────────────────────────
-◎ MEMORY: 💬 1 Sessions   │   🧠 24 / 28.8K obs (claude-mem)   │   🟧 CC 2.1.160
 ──────────────────────────────────────────────────────────────────────────
 ▸ TASKS: 2 bg   │   1 agent       (only when active)
 ```
@@ -116,17 +114,9 @@ API response). On API-key accounts / older Claude Code it falls back to the `ccu
 | **Branch / Age / Mod / Sync** | Git branch, age of last commit, count of uncommitted files, ahead/behind upstream. Hidden when not in a git repo. |
 | **PR** | Open pull request for the current branch (`pr.number` + `pr.review_state`): `✓` approved, `✗` changes requested, `●` pending, `◷` draft. Only shown when a PR is open. |
 
-> Inside Warp this row drops PWD / Branch / Mod (Warp shows them natively) and keeps only Age / Sync / PR — see [Warp integration](#warp-integration).
+> Inside Warp this whole row is hidden (Warp shows cwd / branch / changes natively) — see [Warp integration](#warp-integration).
 
-### Row 7 — MEMORY
-
-| Field | Meaning |
-|---|---|
-| **💬 Sessions** | Number of `.jsonl` transcript files for this project — i.e. how many times you've started Claude Code in this directory. Includes the current session. |
-| **🧠 obs (claude-mem)** | Observations from the [claude-mem](https://github.com/thedotmack/claude-mem) plugin's SQLite DB at `~/.claude-mem/claude-mem.db`. Shown as `local / total` when this project has any observations recorded, otherwise just the global total. |
-| **🟧 CC** | The Claude Code CLI version. |
-
-### Row 8 — TASKS (conditional)
+### Row 7 — TASKS (conditional)
 
 Only appears when there's at least one in-flight item.
 
@@ -227,7 +217,6 @@ Or manually: delete `~/.claude/imperStatusLine.sh` and remove the `statusLine` f
 | Tool | Required? | Purpose | Install |
 |---|---|---|---|
 | `jq` | **yes** | JSON parsing (used everywhere) | `brew install jq` / `apt install jq` |
-| `sqlite3` | optional | claude-mem `obs` counter | macOS includes it; otherwise `brew install sqlite` |
 | `ccusage` | optional | **fallback** 5h quota, only when Claude Code does not provide `rate_limits` natively | nothing to install — runs via `npx -y ccusage@latest` automatically (first run downloads it in background) |
 | `python3` | optional | parsing the ccusage fallback reset timestamp | macOS includes it |
 
@@ -287,7 +276,7 @@ the fields that would duplicate Warp's bar**:
 
 So inside Warp the `◆ PWD …` row disappears completely, and the SESSION row drops its
 `Lines +/-` segment (leaving `Cost │ Uptime`). Everything Warp does *not* show
-(context, tokens, quota, memory, …) stays.
+(context, tokens, quota, …) stays.
 
 - **Detection:** Warp exports `TERM_PROGRAM=WarpTerminal`, which the status-line
   subprocess inherits.
@@ -323,7 +312,7 @@ The script avoids macOS-vs-Linux pitfalls (no `tac`, no `timeout`, no GNU-only `
 
 - Layout, color palette, and "render-as-block-with-separators" approach borrowed from [PAI v5.0.0](https://github.com/danielmiessler/Personal_AI_Infrastructure) by Daniel Miessler — credit where credit is due.
 - Token-aggregation **fallback** methodology aligned with [ccstatusline](https://github.com/sirmalloc/ccstatusline) by sirmalloc (filter by `stop_reason` to skip streaming partials, last main-chain entry for context length) — used only when Claude Code does not provide the native `context_window` field.
-- Strips PAI-specific bits (Workflows, Algorithm, Learning, Quote, Banner, …) and adds Claude-Code-specific signals: EFFORT, PERM, SESSION cost / lines / uptime, the QUOTA (5h + 7d) row, PR review state, the conditional TASKS line, and per-project claude-mem `obs`. Prefers Claude Code's native stdin fields (`context_window`, `cost`, `effort`, `rate_limits`, `pr`) where available.
+- Strips PAI-specific bits (Workflows, Algorithm, Learning, Quote, Banner, …) and adds Claude-Code-specific signals: EFFORT, PERM, SESSION cost / lines / uptime, the QUOTA (5h + 7d) row, PR review state, and the conditional TASKS line. Prefers Claude Code's native stdin fields (`context_window`, `cost`, `effort`, `rate_limits`, `pr`) where available, and deduplicates against Warp's native bottom bar.
 
 ## License
 

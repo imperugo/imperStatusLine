@@ -19,9 +19,10 @@
 #       └─ hidden entirely inside Warp (its native bottom bar already shows cwd,
 #          branch and working-tree changes); the SESSION row also drops Lines +/-.
 #   ──────────────────────────────────
-#   ◎ MEMORY: Sessions │ claude-mem │ CC version
-#   ──────────────────────────────────
 #   ▸ TASKS: N bg │ N agent   (only if active)
+#
+#   Separators are LEADING (each section prints its own divider on top), so the
+#   last visible row never leaves a dangling separator line.
 #
 # ─── Data sources ───────────────────────────────────────────────────────────────
 #   Claude Code >= 2.1.x passes context/cost/effort/rate_limits/pr natively in the
@@ -152,7 +153,6 @@ MODEL_NAME="$(j '.model.display_name // .model.id // "unknown"')"
 SESSION_ID="$(j '.session_id // ""')"
 TRANSCRIPT="$(j '.transcript_path // ""')"
 CWD="$(j '.workspace.current_dir // .cwd // ""')"
-CC_VERSION="$(j '.version // ""')"
 COST_USD="$(j '.cost.total_cost_usd // 0')"
 OUTPUT_STYLE="$(j '.output_style.name // "default"')"
 # Permission mode: try snake_case (Claude Code statusline JSON) and camelCase
@@ -386,12 +386,13 @@ fi
 case "$CTX_PCT" in ''|*[!0-9]*) CTX_PCT=0 ;; esac
 [ "$CTX_PCT" -gt 100 ] && CTX_PCT=100
 
-# Render context bar — width adapts to terminal width
+# Render context bar — width adapts to terminal width.
+# $2 = columns to reserve for the "● CONTEXT: " prefix + the trailing
+# "  XX% (1M) ⚠200k" suffix, computed by the caller from the ACTUAL text so the
+# line never runs past the render width (which would collide with the right edge).
 render_ctx_bar() {
-    local pct="$1" cells i fill
-    # Reserve ~22 chars for "● CONTEXT  " prefix and "  XX%  (1M)" suffix.
-    # Sized to RCOLS (usable render width) so it never overflows the panel.
-    cells=$(( RCOLS - 22 ))
+    local pct="$1" reserve="${2:-22}" cells i fill
+    cells=$(( RCOLS - reserve ))
     [ "$cells" -lt 10 ] && cells=10
     fill=$(( pct * cells / 100 ))
     printf '%b' "$(color_pct "$pct")"
@@ -506,37 +507,6 @@ if [ -n "$CWD" ] && [ -d "$CWD" ] && git -C "$CWD" rev-parse --is-inside-work-tr
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MEMORY counts — proposta A: Files | claude-mem | Wiki | Plugins
-# ─────────────────────────────────────────────────────────────────────────────
-# Sessions: count of Claude Code transcript files (.jsonl) for this project.
-# Claude Code normalizes the cwd into a project key by replacing every
-# non-alphanumeric character with a dash (e.g. "ugo.lattanzi" → "ugo-lattanzi"),
-# not just slashes — matching that behavior is required to find the right dir.
-MEM_PROJECT_KEY="$(echo "$CWD" | sed 's|[^a-zA-Z0-9]|-|g')"
-MEM_PROJECT_DIR="$HOME/.claude/projects/${MEM_PROJECT_KEY}"
-MEM_SESSIONS=$(find "$MEM_PROJECT_DIR" -maxdepth 1 -name "*.jsonl" 2>/dev/null | wc -l | tr -d ' ')
-
-# claude-mem observations: SQLite DB at ~/.claude-mem/claude-mem.db.
-# We pull two counts in one connection: the global total (across all projects)
-# and the count for THIS project, where claude-mem identifies projects by the
-# cwd basename (e.g. "imperugo", "moresi-agent-framework"). The local count is
-# 0 if claude-mem hasn't observed this project yet.
-MEM_OBS=0; MEM_OBS_LOCAL=0
-if [ -f "$HOME/.claude-mem/claude-mem.db" ] && command -v sqlite3 >/dev/null 2>&1; then
-    PROJ_BASE="${CWD##*/}"
-    # Escape single quotes for SQL literal safety (' → '')
-    PROJ_BASE_SQL="${PROJ_BASE//\'/\'\'}"
-    read -r MEM_OBS MEM_OBS_LOCAL < <(
-        sqlite3 -separator ' ' "$HOME/.claude-mem/claude-mem.db" \
-            "SELECT (SELECT COUNT(*) FROM observations), (SELECT COUNT(*) FROM observations WHERE project = '${PROJ_BASE_SQL}')" 2>/dev/null
-    )
-fi
-
-MEM_SESSIONS=${MEM_SESSIONS:-0}
-MEM_OBS=${MEM_OBS:-0}
-MEM_OBS_LOCAL=${MEM_OBS_LOCAL:-0}
-
-# ─────────────────────────────────────────────────────────────────────────────
 # TASKS — count active background tasks/agents from transcript (cached 3s)
 # ─────────────────────────────────────────────────────────────────────────────
 TASKS_BG=0; TASKS_AGENT=0
@@ -610,9 +580,11 @@ elif [ "$CTX_MAX" -ge 1000 ];    then CTX_MAX_LABEL="$(( CTX_MAX / 1000 ))k"
 else                                  CTX_MAX_LABEL="$CTX_MAX"
 fi
 
-# exceeds_200k flag → a red "⚠200k" marker on the CONTEXT line (relevant on 1M models)
+# exceeds_200k flag → a red "⚠ 200k" marker on the CONTEXT line (relevant on 1M
+# models). The space after ⚠ is required: it is an emoji-presentation glyph (~2
+# cells wide), so without it the triangle overlaps the following "2".
 EXCEEDS_MARK=""
-[ "$EXCEEDS_200K" = "true" ] && EXCEEDS_MARK=" ⚠200k"
+[ "$EXCEEDS_200K" = "true" ] && EXCEEDS_MARK=" ⚠ 200k"
 
 # Warp deduplication. Warp shows the cwd path, git branch, and working-tree
 # changes (files + line diff) in its own native bottom bar, so when we detect Warp
@@ -681,15 +653,21 @@ printf '%bENV: %b Agents %b%s%b   %b│%b   SK %b%s%b   %b│%b   Hooks %b%s%b  
 
 sep
 
-# Row 3: CONTEXT bar (sized to RCOLS) + percentage + window size + 200k warning
+# Row 3: CONTEXT bar + percentage + window size + 200k warning. Reserve exactly the
+# prefix ("● CONTEXT: " = 11 cols) + the ACTUAL suffix width + 3 pad (for the ⚠
+# emoji's possible double width), so the line never runs past the render width and
+# collides with the terminal's right edge (e.g. Warp's scrollbar).
+ctx_suffix="  ${CTX_PCT}% (${CTX_MAX_LABEL})${EXCEEDS_MARK}"
 printf '%b●%b %bCONTEXT:%b ' "$CTX_COLOR" "$R" "$C_LABEL" "$R"
-render_ctx_bar "$CTX_PCT"
+render_ctx_bar "$CTX_PCT" "$(( 11 + ${#ctx_suffix} + 3 ))"
 printf '  %b%s%%%b %b(%s)%b%b%s%b\n' \
     "$CTX_COLOR" "$CTX_PCT" "$R" \
     "$C_VALUE_DIM" "$CTX_MAX_LABEL" "$R" \
     "$C_RED" "$EXCEEDS_MARK" "$R"
 
-sep
+# From here down, each section prints its OWN leading separator (guarded by the
+# same condition that renders it) so the last visible row never leaves a dangling
+# separator — and removing a row can't strand one either.
 
 # Row 3b: TOKENS — cumulative session token breakdown
 #   In     = NEW input tokens spent this session (small with prompt cache)
@@ -697,6 +675,7 @@ sep
 #   Cached = cache_read + cache_creation (the bulk on long sessions)
 #   Total  = In + Out + Cached
 if [ "$SES_TOTAL" -gt 0 ]; then
+    sep
     printf '%b🔢 TOKENS:%b In %b%s%b   %b│%b   Out %b%s%b   %b│%b   Cached %b%s%b   %b│%b   Total %b%s%b\n' \
         "$C_LABEL" "$R" \
         "$C_VALUE" "$(fmt_n "$SES_IN")" "$R" \
@@ -714,11 +693,11 @@ if [ "$SES_TOTAL" -gt 0 ]; then
     fi
     printf '   %b│%b   Uptime %b%s%b\n' \
         "$C_SEP" "$R" "$C_VALUE" "$(fmt_uptime "$SES_UPTIME_MIN")" "$R"
-    sep
 fi
 
 # Row 4: QUOTA — 5h + 7d rate limits (native rate_limits, else ccusage 5h only)
 if [ "$USAGE_5H_PCT" != "--" ]; then
+    sep
     q5_color=$(color_pct "$USAGE_5H_PCT")
     printf '%b📊 QUOTA:%b 5h %b%s%%%b' "$C_LABEL" "$R" "$q5_color" "$USAGE_5H_PCT" "$R"
     [ -n "$USAGE_5H_RESET" ] && printf ' %b↺%s%b' "$C_VALUE_DIM" "$USAGE_5H_RESET" "$R"
@@ -728,13 +707,13 @@ if [ "$USAGE_5H_PCT" != "--" ]; then
         [ -n "$USAGE_7D_RESET" ] && printf ' %b↺%s%b' "$C_VALUE_DIM" "$USAGE_7D_RESET" "$R"
     fi
     printf '\n'
-    sep
 fi
 
 # Row 5: PWD + git. In Warp (DEDUP=1, set above) the entire row is suppressed —
 # Warp's native bottom bar already shows the cwd path, branch and working-tree
 # changes, so the whole "◆ PWD … git …" row would be redundant.
 if [ "$DEDUP" -eq 0 ]; then
+    sep
     printf '%b◆ PWD:%b %b%s%b' "$C_LABEL" "$R" "$C_VALUE" "$SHORT_CWD" "$R"
     if [ -n "$GIT_BRANCH" ]; then
         printf '   %b│%b   %bBranch:%b %b%s%b' "$C_SEP" "$R" "$C_LABEL" "$R" "$C_VALUE" "$GIT_BRANCH" "$R"
@@ -751,26 +730,9 @@ if [ "$DEDUP" -eq 0 ]; then
         printf '   %b(not a git repo)%b' "$C_VALUE_DIM" "$R"
     fi
     printf '\n'
-    sep
 fi
 
-# Row 6: MEMORY. Agents lives in the ENV row now (alongside SK/Hooks/Plugins/CMD);
-# the CC version takes its slot here so the row keeps three balanced columns.
-# Units: Sessions = .jsonl transcript files for this project; obs = rows in
-# claude-mem SQLite DB shown as "local / total" when local > 0; CC = Claude
-# Code CLI version.
-if [ "$MEM_OBS_LOCAL" -gt 0 ]; then
-    obs_display="$MEM_OBS_LOCAL / $(fmt_n "$MEM_OBS")"
-else
-    obs_display="$MEM_OBS"
-fi
-printf '%b◎ MEMORY:%b 💬 %b%s%b %bSessions%b   %b│%b   🧠 %b%s%b %bobs%b %b(claude-mem)%b   %b│%b   🟧 %bCC%b %b%s%b\n' \
-    "$C_LABEL" "$R" \
-    "$C_VALUE" "$MEM_SESSIONS" "$R" "$C_PURPLE" "$R" \
-    "$C_SEP" "$R" "$C_VALUE" "$obs_display" "$R" "$C_PURPLE" "$R" "$C_VALUE_DIM" "$R" \
-    "$C_SEP" "$R" "$C_PURPLE" "$R" "$C_VALUE" "$CC_VERSION" "$R"
-
-# Row 7: TASKS (only if any active)
+# Row 6: TASKS (only if any active)
 if [ "$TASKS_BG" -gt 0 ] || [ "$TASKS_AGENT" -gt 0 ]; then
     sep
     printf '%b▸ TASKS:%b' "$C_LABEL" "$R"
