@@ -9,16 +9,25 @@
 #   TIME │ MODEL │ EFFORT │ PERM
 #   ENV  │ Agents │ SK │ Hooks │ Plugins │ CMD
 #   ──────────────────────────────────
-#   ● CONTEXT bar (full width, gradient green→yellow→red)
+#   ● CONTEXT bar (sized to render width) + % + window size + ⚠200k flag
 #   ──────────────────────────────────
 #   🔢 TOKENS:  In │ Out │ Cached │ Total
-#   💰 SESSION: Cost │ Calls │ Uptime │ ↺Reset5h
+#   💰 SESSION: Cost │ Lines +/- │ Uptime
+#   📊 QUOTA:   5h % ↺reset │ 7d % ↺reset
 #   ──────────────────────────────────
-#   ◆ PWD │ Branch │ Age │ Mod │ Sync   (or "(not a git repo)")
+#   ◆ PWD │ Branch │ Age │ Mod │ Sync │ PR   (or "(not a git repo)")
 #   ──────────────────────────────────
 #   ◎ MEMORY: Sessions │ claude-mem │ CC version
 #   ──────────────────────────────────
 #   ▸ TASKS: N bg │ N agent   (only if active)
+#
+# ─── Data sources ───────────────────────────────────────────────────────────────
+#   Claude Code >= 2.1.x passes context/cost/effort/rate_limits/pr natively in the
+#   stdin JSON; we use those. On older CC (or before the first API call) we fall
+#   back to parsing the transcript and to `ccusage` for the 5h quota.
+#   Render width: CC exports COLUMNS (>= v2.1.153). The status line is indented,
+#   so full-width content is sized to COLUMNS minus IMPERSL_WIDTH_MARGIN (default 4)
+#   to avoid the overflow/truncation that full-COLUMNS sizing caused.
 #
 # ─── Setup ────────────────────────────────────────────────────────────────────
 #   1. Save this script as ~/.claude/imperStatusLine.sh
@@ -33,8 +42,9 @@
 # ─── Optional dependencies ────────────────────────────────────────────────────
 #   - jq          (required) — JSON parsing
 #   - sqlite3     (optional) — counts claude-mem observations
-#   - npx + ccusage (optional) — populates the USAGE 5H quota line
-#                                first run takes ~30s in background, then cached
+#   - npx + ccusage (optional) — FALLBACK for the 5h quota only when CC does not
+#                                provide rate_limits natively; first run ~30s in
+#                                background, then cached
 #
 # ─── Colors ───────────────────────────────────────────────────────────────────
 #   256-color ANSI palette borrowed from PAI v5.0.0
@@ -105,15 +115,26 @@ fmt_n() {
     fi
 }
 
-# Detect terminal width (fallback 100)
+# Detect terminal width. Since Claude Code v2.1.153 the statusline subprocess
+# gets COLUMNS exported by CC itself (stdout is captured, so `tput cols` can't
+# read the tty from inside the script). Prefer COLUMNS; fall back to tput, 100.
 TERM_COLS="${COLUMNS:-0}"
 [ "$TERM_COLS" -le 0 ] && TERM_COLS=$(tput cols 2>/dev/null || echo 100)
 [ "$TERM_COLS" -le 0 ] && TERM_COLS=100
 
-# Print a thin horizontal separator line, full terminal width
+# IMPORTANT: the status line is rendered INDENTED inside the UI (CC's built-in
+# spacing plus the `padding` setting), so the usable width is narrower than the
+# full terminal. Sizing full-width content (bars, separators) to TERM_COLS makes
+# it overflow and get truncated with "…" — the bug this layout used to hit.
+# RCOLS is the safe render width; tune the reserve via IMPERSL_WIDTH_MARGIN.
+WIDTH_MARGIN="${IMPERSL_WIDTH_MARGIN:-4}"
+RCOLS=$(( TERM_COLS - WIDTH_MARGIN ))
+[ "$RCOLS" -lt 20 ] && RCOLS=20
+
+# Print a thin horizontal separator line, sized to the usable render width
 sep() {
     local i line=""
-    for ((i=0; i<TERM_COLS; i++)); do line="${line}─"; done
+    for ((i=0; i<RCOLS; i++)); do line="${line}─"; done
     printf '%b%s%b\n' "$C_LINE" "$line" "$R"
 }
 
@@ -141,6 +162,31 @@ if [ -z "$PERM_MODE" ] && [ -f "$TRANSCRIPT" ]; then
         | tail -1 | sed 's/.*"permissionMode":"\([^"]*\)".*/\1/')
 fi
 [ -z "$PERM_MODE" ] && PERM_MODE="default"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NATIVE FIELDS (Claude Code >= 2.1.x). When present these replace the manual
+# transcript parsing and the ccusage subprocess; we fall back to those when a
+# field is absent (older CC, or before the first API call / right after /compact).
+# ─────────────────────────────────────────────────────────────────────────────
+CW_USED_PCT="$(j '.context_window.used_percentage // empty')"
+CW_SIZE="$(j '.context_window.context_window_size // empty')"
+CW_IN="$(j '.context_window.total_input_tokens // empty')"
+CW_OUT="$(j '.context_window.total_output_tokens // empty')"
+CW_CUR_IN="$(j '.context_window.current_usage.input_tokens // empty')"
+CW_CUR_OUT="$(j '.context_window.current_usage.output_tokens // empty')"
+CW_CUR_CC="$(j '.context_window.current_usage.cache_creation_input_tokens // empty')"
+CW_CUR_CR="$(j '.context_window.current_usage.cache_read_input_tokens // empty')"
+EXCEEDS_200K="$(j '.exceeds_200k_tokens // empty')"
+EFFORT_LEVEL="$(j '.effort.level // empty')"
+DURATION_MS="$(j '.cost.total_duration_ms // empty')"
+LINES_ADD="$(j '.cost.total_lines_added // empty')"
+LINES_DEL="$(j '.cost.total_lines_removed // empty')"
+RL_5H_PCT="$(j '.rate_limits.five_hour.used_percentage // empty')"
+RL_5H_RESET="$(j '.rate_limits.five_hour.resets_at // empty')"
+RL_7D_PCT="$(j '.rate_limits.seven_day.used_percentage // empty')"
+RL_7D_RESET="$(j '.rate_limits.seven_day.resets_at // empty')"
+PR_NUM="$(j '.pr.number // empty')"
+PR_STATE="$(j '.pr.review_state // empty')"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # COUNTS — skills, hooks, commands, plugins (cached, mtime-based)
@@ -217,16 +263,37 @@ source "$COUNTS_CACHE"
 # ─────────────────────────────────────────────────────────────────────────────
 # CONTEXT % from transcript (token estimate)
 # ─────────────────────────────────────────────────────────────────────────────
-# Claude Opus 4.7 1M: 1_000_000 token budget; standard models: 200_000
-case "$MODEL_ID" in
-    *"1m"*|*"1M"*|*opus-4-7*) CTX_MAX=1000000 ;;
-    *) CTX_MAX=200000 ;;
-esac
+# Context window size: prefer the native field; fall back to model-id guessing.
+if [ -n "$CW_SIZE" ] && [ "$CW_SIZE" -gt 0 ] 2>/dev/null; then
+    CTX_MAX="$CW_SIZE"
+else
+    case "$MODEL_ID" in
+        *"1m"*|*"1M"*|*opus-4-7*) CTX_MAX=1000000 ;;
+        *) CTX_MAX=200000 ;;
+    esac
+fi
 
 CTX_USED=0
 SES_IN=0; SES_OUT=0; SES_CACHED=0; SES_TOTAL=0
 SES_CALLS=0; SES_UPTIME_MIN=0
-if [ -f "$TRANSCRIPT" ]; then
+
+# NATIVE PATH: context_window + cost are provided directly. used_percentage is
+# the live occupancy; total_input/output reflect CURRENT context (v2.1.132+),
+# and current_usage breaks the input side into fresh / cache_read / cache_creation.
+NATIVE_TOKENS=0
+if [ -n "$CW_USED_PCT" ]; then
+    NATIVE_TOKENS=1
+    CTX_PCT_NATIVE="${CW_USED_PCT%.*}"            # floor "42.7" → "42"
+    [ -z "$CTX_PCT_NATIVE" ] && CTX_PCT_NATIVE=0
+    SES_IN="${CW_CUR_IN:-${CW_IN:-0}}"
+    SES_OUT="${CW_CUR_OUT:-${CW_OUT:-0}}"
+    SES_CACHED=$(( ${CW_CUR_CR:-0} + ${CW_CUR_CC:-0} ))
+    SES_TOTAL=$(( SES_IN + SES_OUT + SES_CACHED ))
+    [ -n "$DURATION_MS" ] && SES_UPTIME_MIN=$(( DURATION_MS / 60000 ))
+fi
+
+# FALLBACK PATH: parse the transcript only when the native context field is absent.
+if [ "$NATIVE_TOKENS" -eq 0 ] && [ -f "$TRANSCRIPT" ]; then
     # Token metrics methodology (aligned with sirmalloc/ccstatusline):
     #   * Streaming writes multiple JSONL entries per API call: intermediate ones
     #     have stop_reason: null (partial chunks), the final one has a string
@@ -308,16 +375,21 @@ fmt_uptime() {
     fi
 }
 
-CTX_PCT=$(( CTX_USED * 100 / CTX_MAX ))
+if [ "$NATIVE_TOKENS" -eq 1 ]; then
+    CTX_PCT="$CTX_PCT_NATIVE"
+else
+    CTX_PCT=$(( CTX_USED * 100 / CTX_MAX ))
+fi
+case "$CTX_PCT" in ''|*[!0-9]*) CTX_PCT=0 ;; esac
 [ "$CTX_PCT" -gt 100 ] && CTX_PCT=100
 
 # Render context bar — width adapts to terminal width
 render_ctx_bar() {
     local pct="$1" cells i fill
-    # Reserve ~16 chars for "● CONTEXT: " prefix and "  XX%" suffix
-    cells=$(( TERM_COLS - 18 ))
+    # Reserve ~22 chars for "● CONTEXT  " prefix and "  XX%  (1M)" suffix.
+    # Sized to RCOLS (usable render width) so it never overflows the panel.
+    cells=$(( RCOLS - 22 ))
     [ "$cells" -lt 10 ] && cells=10
-    [ "$cells" -gt 200 ] && cells=200
     fill=$(( pct * cells / 100 ))
     printf '%b' "$(color_pct "$pct")"
     for ((i=0; i<fill; i++)); do printf '◉'; done
@@ -327,46 +399,66 @@ render_ctx_bar() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# USAGE 5H quota via ccusage (cached 60s)
+# QUOTA — 5h + 7d rate limits. Native (rate_limits.*) when present, else ccusage.
 # ─────────────────────────────────────────────────────────────────────────────
-USAGE_5H_PCT="--"
-USAGE_5H_RESET=""
+USAGE_5H_PCT="--"; USAGE_5H_RESET=""
+USAGE_7D_PCT="--"; USAGE_7D_RESET=""
 
-if needs_refresh "$CCUSAGE_CACHE" "$CCUSAGE_TTL"; then
-    # Fire-and-forget: never block the statusline. Cache populates async,
-    # next refresh will pick it up. All output suppressed.
-    LOCK="$CCUSAGE_CACHE.lock"
-    if ! [ -f "$LOCK" ] || [ "$(find "$LOCK" -mmin +2 2>/dev/null)" ]; then
-        : > "$LOCK"
-        (
-            npx -y ccusage@latest blocks --json --active > "$CCUSAGE_CACHE.tmp" 2>/dev/null \
-                && [ -s "$CCUSAGE_CACHE.tmp" ] \
-                && mv "$CCUSAGE_CACHE.tmp" "$CCUSAGE_CACHE" \
-                || rm -f "$CCUSAGE_CACHE.tmp"
-            rm -f "$LOCK"
-        ) </dev/null >/dev/null 2>&1 &
-        disown 2>/dev/null || true
+# Format a Unix epoch (seconds) using BSD `date -r` or GNU `date -d @…`.
+fmt_epoch() {  # $1=epoch  $2=strftime format
+    local e="$1" f="$2"
+    case "$e" in ''|*[!0-9]*) return ;; esac
+    date -r "$e" "+$f" 2>/dev/null || date -d "@$e" "+$f" 2>/dev/null
+}
+
+if [ -n "$RL_5H_PCT" ]; then
+    # NATIVE: Claude.ai Pro/Max only, populated after the first API response.
+    # resets_at is Unix epoch seconds. seven_day may be absent independently.
+    USAGE_5H_PCT="${RL_5H_PCT%.*}"; [ -z "$USAGE_5H_PCT" ] && USAGE_5H_PCT=0
+    USAGE_5H_RESET="$(fmt_epoch "$RL_5H_RESET" '%H:%M')"
+    if [ -n "$RL_7D_PCT" ]; then
+        USAGE_7D_PCT="${RL_7D_PCT%.*}"; [ -z "$USAGE_7D_PCT" ] && USAGE_7D_PCT=0
+        USAGE_7D_RESET="$(fmt_epoch "$RL_7D_RESET" '%b %d')"
     fi
-fi
-
-if [ -f "$CCUSAGE_CACHE" ]; then
-    # ccusage `blocks --active` returns the current 5h block with tokens vs quota
-    USAGE_5H_PCT=$(jq -r '
-        .blocks[0] // {} |
-        if .totalTokens and .tokenLimitStatus then
-            ((.totalTokens / (.tokenLimitStatus.limit // 1)) * 100 | floor)
-        else "--" end
-    ' "$CCUSAGE_CACHE" 2>/dev/null)
-    USAGE_5H_RESET=$(jq -r '.blocks[0].endTime // ""' "$CCUSAGE_CACHE" 2>/dev/null \
-        | python3 -c "import sys,datetime; t=sys.stdin.read().strip(); print(datetime.datetime.fromisoformat(t.replace('Z','+00:00')).astimezone().strftime('%H:%M')) if t else ''" 2>/dev/null)
-    [ -z "$USAGE_5H_PCT" ] && USAGE_5H_PCT="--"
+else
+    # FALLBACK (older CC / API-key users): ccusage subprocess, 5h block only.
+    if needs_refresh "$CCUSAGE_CACHE" "$CCUSAGE_TTL"; then
+        # Fire-and-forget: never block the statusline. Cache populates async,
+        # next refresh will pick it up. All output suppressed.
+        LOCK="$CCUSAGE_CACHE.lock"
+        if ! [ -f "$LOCK" ] || [ "$(find "$LOCK" -mmin +2 2>/dev/null)" ]; then
+            : > "$LOCK"
+            (
+                npx -y ccusage@latest blocks --json --active > "$CCUSAGE_CACHE.tmp" 2>/dev/null \
+                    && [ -s "$CCUSAGE_CACHE.tmp" ] \
+                    && mv "$CCUSAGE_CACHE.tmp" "$CCUSAGE_CACHE" \
+                    || rm -f "$CCUSAGE_CACHE.tmp"
+                rm -f "$LOCK"
+            ) </dev/null >/dev/null 2>&1 &
+            disown 2>/dev/null || true
+        fi
+    fi
+    if [ -f "$CCUSAGE_CACHE" ]; then
+        USAGE_5H_PCT=$(jq -r '
+            .blocks[0] // {} |
+            if .totalTokens and .tokenLimitStatus then
+                ((.totalTokens / (.tokenLimitStatus.limit // 1)) * 100 | floor)
+            else "--" end
+        ' "$CCUSAGE_CACHE" 2>/dev/null)
+        USAGE_5H_RESET=$(jq -r '.blocks[0].endTime // ""' "$CCUSAGE_CACHE" 2>/dev/null \
+            | python3 -c "import sys,datetime; t=sys.stdin.read().strip(); print(datetime.datetime.fromisoformat(t.replace('Z','+00:00')).astimezone().strftime('%H:%M')) if t else ''" 2>/dev/null)
+        [ -z "$USAGE_5H_PCT" ] && USAGE_5H_PCT="--"
+    fi
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # EFFORT (thinking budget)
 # ─────────────────────────────────────────────────────────────────────────────
 EFFORT="default"
-if [ -n "$CLAUDE_THINKING_LEVEL" ]; then
+if [ -n "$EFFORT_LEVEL" ]; then
+    # NATIVE: live effort level (low/medium/high/xhigh/max), incl. mid-session /effort.
+    EFFORT="$EFFORT_LEVEL"
+elif [ -n "$CLAUDE_THINKING_LEVEL" ]; then
     EFFORT="$CLAUDE_THINKING_LEVEL"
 elif [ -n "$THINKING_BUDGET" ]; then
     EFFORT="$THINKING_BUDGET"
@@ -376,7 +468,7 @@ else
 fi
 EFFORT_LOWER=$(echo "$EFFORT" | tr '[:upper:]' '[:lower:]')
 case "$EFFORT_LOWER" in
-    max|high|*32000*|*64000*) EFFORT_COLOR="$C_RED" ;;
+    max|xhigh|high|*32000*|*64000*) EFFORT_COLOR="$C_RED" ;;
     medium|*16000*)            EFFORT_COLOR="$C_YELLOW" ;;
     low|*8000*|*4000*)         EFFORT_COLOR="$C_GREEN" ;;
     *)                          EFFORT_COLOR="$C_VALUE_DIM" ;;
@@ -502,6 +594,28 @@ if [ "$USAGE_5H_PCT" != "--" ]; then
     USAGE_COLOR=$(color_pct "$USAGE_5H_PCT")
 fi
 
+# Human label for the context window size (1M / 200k / …)
+if   [ "$CTX_MAX" -ge 1000000 ]; then CTX_MAX_LABEL="$(( CTX_MAX / 1000000 ))M"
+elif [ "$CTX_MAX" -ge 1000 ];    then CTX_MAX_LABEL="$(( CTX_MAX / 1000 ))k"
+else                                  CTX_MAX_LABEL="$CTX_MAX"
+fi
+
+# exceeds_200k flag → a red "⚠200k" marker on the CONTEXT line (relevant on 1M models)
+EXCEEDS_MARK=""
+[ "$EXCEEDS_200K" = "true" ] && EXCEEDS_MARK=" ⚠200k"
+
+# PR review state → symbol + color (shown on the PWD/git row when a PR is open)
+PR_SYM=""; PR_COLOR="$C_VALUE_DIM"
+if [ -n "$PR_NUM" ]; then
+    case "$PR_STATE" in
+        approved)          PR_SYM="✓"; PR_COLOR="$C_GREEN" ;;
+        changes_requested) PR_SYM="✗"; PR_COLOR="$C_RED" ;;
+        pending)           PR_SYM="●"; PR_COLOR="$C_YELLOW" ;;
+        draft)             PR_SYM="◷"; PR_COLOR="$C_VALUE_DIM" ;;
+        *)                 PR_SYM="";  PR_COLOR="$C_VALUE" ;;
+    esac
+fi
+
 # Permission mode → short label + color (red for bypass = "be careful")
 case "$PERM_MODE" in
     bypassPermissions) PERM_SHORT="bypass";       PERM_COLOR="$C_RED" ;;
@@ -548,10 +662,13 @@ printf '%bENV: %b Agents %b%s%b   %b│%b   SK %b%s%b   %b│%b   Hooks %b%s%b  
 
 sep
 
-# Row 3: CONTEXT bar (full width)
+# Row 3: CONTEXT bar (sized to RCOLS) + percentage + window size + 200k warning
 printf '%b●%b %bCONTEXT:%b ' "$CTX_COLOR" "$R" "$C_LABEL" "$R"
 render_ctx_bar "$CTX_PCT"
-printf '  %b%s%%%b\n' "$CTX_COLOR" "$CTX_PCT" "$R"
+printf '  %b%s%%%b %b(%s)%b%b%s%b\n' \
+    "$CTX_COLOR" "$CTX_PCT" "$R" \
+    "$C_VALUE_DIM" "$CTX_MAX_LABEL" "$R" \
+    "$C_RED" "$EXCEEDS_MARK" "$R"
 
 sep
 
@@ -568,14 +685,25 @@ if [ "$SES_TOTAL" -gt 0 ]; then
         "$C_SEP" "$R" "$C_GREEN" "$(fmt_n "$SES_CACHED")" "$R" \
         "$C_SEP" "$R" "$C_VALUE" "$(fmt_n "$SES_TOTAL")" "$R"
 
-    # Row 3c: SESSION meta — cost, calls, uptime, next 5h reset
-    printf '%b💰 SESSION:%b Cost %b%s%b   %b│%b   Calls %b%s%b   %b│%b   Uptime %b%s%b' \
+    # Row 3c: SESSION meta — cost, lines changed (native), uptime.
+    # The 5h/7d reset moved to the dedicated QUOTA row below.
+    printf '%b💰 SESSION:%b Cost %b%s%b   %b│%b   Lines %b+%s%b/%b-%s%b   %b│%b   Uptime %b%s%b\n' \
         "$C_LABEL" "$R" \
         "$C_GREEN" "$COST_FMT" "$R" \
-        "$C_SEP" "$R" "$C_VALUE" "$SES_CALLS" "$R" \
+        "$C_SEP" "$R" "$C_GREEN" "${LINES_ADD:-0}" "$R" "$C_RED" "${LINES_DEL:-0}" "$R" \
         "$C_SEP" "$R" "$C_VALUE" "$(fmt_uptime "$SES_UPTIME_MIN")" "$R"
-    if [ -n "$USAGE_5H_RESET" ]; then
-        printf '   %b│%b   %b↺%s%b' "$C_SEP" "$R" "$C_VALUE_DIM" "$USAGE_5H_RESET" "$R"
+    sep
+fi
+
+# Row 4: QUOTA — 5h + 7d rate limits (native rate_limits, else ccusage 5h only)
+if [ "$USAGE_5H_PCT" != "--" ]; then
+    q5_color=$(color_pct "$USAGE_5H_PCT")
+    printf '%b📊 QUOTA:%b 5h %b%s%%%b' "$C_LABEL" "$R" "$q5_color" "$USAGE_5H_PCT" "$R"
+    [ -n "$USAGE_5H_RESET" ] && printf ' %b↺%s%b' "$C_VALUE_DIM" "$USAGE_5H_RESET" "$R"
+    if [ "$USAGE_7D_PCT" != "--" ]; then
+        q7_color=$(color_pct "$USAGE_7D_PCT")
+        printf '   %b│%b   7d %b%s%%%b' "$C_SEP" "$R" "$q7_color" "$USAGE_7D_PCT" "$R"
+        [ -n "$USAGE_7D_RESET" ] && printf ' %b↺%s%b' "$C_VALUE_DIM" "$USAGE_7D_RESET" "$R"
     fi
     printf '\n'
     sep
@@ -590,6 +718,10 @@ if [ -n "$GIT_BRANCH" ]; then
         printf '   %b│%b   %bMod:%b %b%s%b' "$C_SEP" "$R" "$C_LABEL" "$R" "$C_YELLOW" "$GIT_MOD" "$R"
     fi
     [ -n "$GIT_SYNC" ] && [ "$GIT_SYNC" != "=" ] && printf '   %b│%b   %bSync:%b %b%s%b' "$C_SEP" "$R" "$C_LABEL" "$R" "$C_PINK" "$GIT_SYNC" "$R"
+    # PR for the current branch (native .pr — only present when one is open)
+    if [ -n "$PR_NUM" ]; then
+        printf '   %b│%b   %bPR:%b %b#%s %s%b' "$C_SEP" "$R" "$C_LABEL" "$R" "$PR_COLOR" "$PR_NUM" "$PR_SYM" "$R"
+    fi
 else
     printf '   %b(not a git repo)%b' "$C_VALUE_DIM" "$R"
 fi

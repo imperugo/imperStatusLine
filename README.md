@@ -8,20 +8,23 @@ A custom status line for [Claude Code](https://docs.claude.com/en/docs/claude-co
 
 ```
 ─ imperStatusLine ─ skill: <output_style>
-TIME: 08:51   │   MODEL: Opus 4.7 (1M)   │   EFFORT: default   │   PERM: bypass
+TIME: 08:51   │   MODEL: Opus (1M)   │   EFFORT: high   │   PERM: bypass
 ENV:  Agents 43   │   SK 162   │   Hooks 2   │   Plugins 29   │   CMD 44
 ──────────────────────────────────────────────────────────────────────────
-● CONTEXT: ◉◉◉◉◉◉◉◉◉◉◉◉◉◉◉◉◉◉◉◉◉◉◉◯◯◯◯◯◯◯◯◯◯◯◯◯◯◯◯◯◯◯◯◯◯◯◯◯◯◯◯◯◯◯  37%
+● CONTEXT: ◉◉◉◉◉◉◉◉◉◉◉◉◉◉◉◉◉◉◉◉◉◉◉◯◯◯◯◯◯◯◯◯◯◯◯◯◯◯◯◯◯◯◯◯◯◯◯◯◯◯◯◯◯◯  37% (1M)
 ──────────────────────────────────────────────────────────────────────────
 🔢 TOKENS:  In 3.0K   │   Out 671.4K   │   Cached 63.8M   │   Total 64.5M
-💰 SESSION: Cost $21.74   │   Calls 288   │   Uptime 1h 4m   │   ↺12:00
+💰 SESSION: Cost $21.74   │   Lines +420/-89   │   Uptime 1h 4m
+📊 QUOTA:   5h 34% ↺12:00   │   7d 12% ↺Jun 06
 ──────────────────────────────────────────────────────────────────────────
-◆ PWD: brand-kit   │   Branch: main   │   Age: 2h   │   Mod: 42
+◆ PWD: brand-kit   │   Branch: main   │   Age: 2h   │   Mod: 42   │   PR: #128 ✓
 ──────────────────────────────────────────────────────────────────────────
-◎ MEMORY: 💬 1 Sessions   │   🧠 24 / 28.8K obs (claude-mem)   │   🟧 CC 2.1.132
+◎ MEMORY: 💬 1 Sessions   │   🧠 24 / 28.8K obs (claude-mem)   │   🟧 CC 2.1.160
 ──────────────────────────────────────────────────────────────────────────
 ▸ TASKS: 2 bg   │   1 agent       (only when active)
 ```
+
+> **Data sources.** Claude Code ≥ 2.1.x passes context usage, cost, effort, rate limits and PR state **natively** in the stdin JSON — the script uses those directly. On older Claude Code (or before the first API call) it falls back to parsing the transcript and to `ccusage` for the 5h quota.
 
 ## Sections explained
 
@@ -37,7 +40,7 @@ ENV:  Agents 43   │   SK 162   │   Hooks 2   │   Plugins 29   │   CMD 44
 |---|---|---|
 | **TIME** | system clock | Local wall-clock time. |
 | **MODEL** | stdin JSON `model.id` | Friendly model label: `Opus 4.7`, `Sonnet 4.6`, `Haiku`, with `(1M)` suffix for 1M-context variants. |
-| **EFFORT** | `CLAUDE_THINKING_LEVEL` env → `THINKING_BUDGET` env → `settings.json` | Thinking budget label (`default` / `low` / `medium` / `high` / `max`). Color-coded: green = low cost, yellow = medium, red = max. |
+| **EFFORT** | stdin `effort.level` (native) → `CLAUDE_THINKING_LEVEL` env → `THINKING_BUDGET` env → `settings.json` | Reasoning effort label (`default` / `low` / `medium` / `high` / `xhigh` / `max`), including mid-session `/effort` changes. Color-coded: green = low, yellow = medium, red = high/xhigh/max. |
 | **PERM** | stdin `permission_mode` (with fallback to `permissionMode` in transcript) | Current permission mode — `default` (green), `accept` (yellow), `bypass` (red), `plan` (purple). At-a-glance "are you running with a safety net?" |
 
 ### Row 2 — ENV / counts
@@ -56,43 +59,64 @@ What the current Claude Code environment can do.
 
 ### CONTEXT bar
 
-A full-width bar showing how much of the model's context window is currently in use.
-Color: green (<60%), yellow (60–80%), red (≥80%).
+A bar showing how much of the model's context window is currently in use, followed
+by the percentage, the window size (`1M` / `200k`), and a red `⚠200k` marker when
+`exceeds_200k_tokens` is set. Color: green (<60%), yellow (60–80%), red (≥80%).
 
-- For Opus 4.7 1M and `*-1m` models the cap is **1,000,000 tokens**.
-- For everything else the cap is **200,000 tokens**.
-- The "used" value is the **last main-chain entry's** `input_tokens + cache_read + cache_creation` — the live context length, the way [ccstatusline](https://github.com/sirmalloc/ccstatusline) measures it.
+- The percentage comes from `context_window.used_percentage` (native) when available;
+  the window size comes from `context_window.context_window_size`.
+- **Fallback** (older Claude Code): the "used" value is the **last main-chain entry's**
+  `input_tokens + cache_read + cache_creation` — the live context length, the way
+  [ccstatusline](https://github.com/sirmalloc/ccstatusline) measures it — over a cap of
+  1,000,000 tokens for `*-1m` / Opus 4.7 models, 200,000 otherwise.
+- The bar is sized to the **usable render width** (terminal width minus a small margin),
+  so it never overflows the indented status-line area. See [Render width](#render-width).
 
-### Row 3 — TOKENS (cumulative session totals)
+### Row 3 — TOKENS
 
-These are **session totals**, not the last call. Don't be surprised if `In` looks tiny — that's the prompt cache doing its job.
+The current-context token breakdown, from `context_window.*` (native). Don't be
+surprised if `In` looks tiny — that's the prompt cache doing its job.
 
 | Field | Meaning |
 |---|---|
-| **In** | New input tokens spent this session — i.e. content NOT served from prompt cache. With caching this stays small. |
+| **In** | Input tokens NOT served from prompt cache (`current_usage.input_tokens`). With caching this stays small. |
 | **Out** | Tokens generated by the model. |
-| **Cached** | `cache_read + cache_creation` summed across the whole session. The bulk of cost-saved volume. |
+| **Cached** | `cache_read + cache_creation`. The bulk of the context volume. |
 | **Total** | `In + Out + Cached`. |
 
-> **Why "Cached" goes into the millions:** every turn the model rereads (most of) the context from cache, so the counter accumulates fast. On a 1-hour session with a 150K context, hitting tens of millions is normal and means caching is working.
+> On older Claude Code (no native `context_window`) these fall back to **cumulative
+> session totals** parsed from the transcript, where `Cached` routinely reaches the
+> millions because each turn rereads most of the context from cache.
 
 ### Row 4 — SESSION meta
 
 | Field | Source | Meaning |
 |---|---|---|
 | **Cost** | stdin JSON `cost.total_cost_usd` | Running session cost in USD, as reported by Claude Code. |
-| **Calls** | finalized assistant entries in the transcript | Number of API calls completed (filtered by `stop_reason` to skip streaming partials). |
-| **Uptime** | first/last timestamps in the transcript | Real wall-clock time of this session. |
-| **↺HH:MM** | `ccusage blocks --active` | When the next 5h ccusage rolling window resets. Hidden if `ccusage` cache is empty. |
+| **Lines** | stdin JSON `cost.total_lines_added` / `total_lines_removed` | Lines added / removed this session, shown as `+N/-M`. |
+| **Uptime** | `cost.total_duration_ms` (native) → transcript timestamps (fallback) | Real wall-clock time of this session. |
 
-### Row 5 — PWD + git
+### Row 5 — QUOTA (rate limits)
+
+Shown when rate-limit data is available (Claude.ai Pro/Max subscribers, after the first
+API response). On API-key accounts / older Claude Code it falls back to the `ccusage`
+5h block only.
+
+| Field | Source | Meaning |
+|---|---|---|
+| **5h %** | `rate_limits.five_hour.used_percentage` → `ccusage` | Usage of the 5-hour rolling window, color-coded. |
+| **7d %** | `rate_limits.seven_day.used_percentage` | Usage of the 7-day rolling window (native only). |
+| **↺** | `…resets_at` (Unix epoch) | When each window next resets (`HH:MM` for 5h, `Mon DD` for 7d). |
+
+### Row 6 — PWD + git
 
 | Field | Meaning |
 |---|---|
 | **PWD** | Last segment of the working directory. |
 | **Branch / Age / Mod / Sync** | Git branch, age of last commit, count of uncommitted files, ahead/behind upstream. Hidden when not in a git repo. |
+| **PR** | Open pull request for the current branch (`pr.number` + `pr.review_state`): `✓` approved, `✗` changes requested, `●` pending, `◷` draft. Only shown when a PR is open. |
 
-### Row 6 — MEMORY
+### Row 7 — MEMORY
 
 | Field | Meaning |
 |---|---|
@@ -100,7 +124,7 @@ These are **session totals**, not the last call. Don't be surprised if `In` look
 | **🧠 obs (claude-mem)** | Observations from the [claude-mem](https://github.com/thedotmack/claude-mem) plugin's SQLite DB at `~/.claude-mem/claude-mem.db`. Shown as `local / total` when this project has any observations recorded, otherwise just the global total. |
 | **🟧 CC** | The Claude Code CLI version. |
 
-### Row 7 — TASKS (conditional)
+### Row 8 — TASKS (conditional)
 
 Only appears when there's at least one in-flight item.
 
@@ -202,8 +226,11 @@ Or manually: delete `~/.claude/imperStatusLine.sh` and remove the `statusLine` f
 |---|---|---|---|
 | `jq` | **yes** | JSON parsing (used everywhere) | `brew install jq` / `apt install jq` |
 | `sqlite3` | optional | claude-mem `obs` counter | macOS includes it; otherwise `brew install sqlite` |
-| `ccusage` | optional | the `↺HH:MM` reset hint on the SESSION row | nothing to install — runs via `npx -y ccusage@latest` automatically (first run downloads it in background) |
-| `python3` | optional | parsing the ccusage reset timestamp | macOS includes it |
+| `ccusage` | optional | **fallback** 5h quota, only when Claude Code does not provide `rate_limits` natively | nothing to install — runs via `npx -y ccusage@latest` automatically (first run downloads it in background) |
+| `python3` | optional | parsing the ccusage fallback reset timestamp | macOS includes it |
+
+> On Claude Code ≥ 2.1.x the native `rate_limits` field makes `ccusage`/`python3`
+> unnecessary — they are only used as a fallback.
 
 ## How it stays fast
 
@@ -218,6 +245,32 @@ The status line runs at **every Claude Code refresh** — so expensive lookups a
 
 The `ccusage` fetch runs **fire-and-forget** in the background, so it never blocks the status line — even when `npx` has to download the package the first time.
 
+> When Claude Code provides the native `context_window` / `cost` / `rate_limits`
+> fields, the transcript parsing and the `ccusage` subprocess are skipped entirely —
+> so on current Claude Code the status line does even less work.
+
+## Render width
+
+Since v2.1.153, Claude Code exports `COLUMNS` to the status-line subprocess (its stdout
+is captured, so `tput cols` can't read the terminal from inside the script). The status
+line is rendered **indented** inside the UI, so its usable width is narrower than the
+full terminal. Full-width content (the context bar and the separator rules) is therefore
+sized to `COLUMNS` **minus a margin**, to avoid overflowing and being truncated with `…`.
+
+The margin defaults to `4`. If the bar still gets clipped (or, conversely, you want it to
+fill more of the row), tune it via the `IMPERSL_WIDTH_MARGIN` environment variable in your
+`statusLine` command:
+
+```jsonc
+{
+  "statusLine": {
+    "type": "command",
+    "command": "IMPERSL_WIDTH_MARGIN=8 bash $HOME/.claude/imperStatusLine.sh",
+    "padding": 0
+  }
+}
+```
+
 ## Compatibility
 
 - ✅ macOS (tested on Darwin 25.x)
@@ -229,8 +282,8 @@ The script avoids macOS-vs-Linux pitfalls (no `tac`, no `timeout`, no GNU-only `
 ## Credits
 
 - Layout, color palette, and "render-as-block-with-separators" approach borrowed from [PAI v5.0.0](https://github.com/danielmiessler/Personal_AI_Infrastructure) by Daniel Miessler — credit where credit is due.
-- Token-aggregation methodology aligned with [ccstatusline](https://github.com/sirmalloc/ccstatusline) by sirmalloc (filter by `stop_reason` to skip streaming partials, last main-chain entry for context length).
-- Strips PAI-specific bits (Workflows, Algorithm, Learning, Quote, Banner, …) and adds Claude-Code-specific signals: EFFORT, PERM, SESSION cost/calls/uptime, the conditional TASKS line, and per-project claude-mem `obs`.
+- Token-aggregation **fallback** methodology aligned with [ccstatusline](https://github.com/sirmalloc/ccstatusline) by sirmalloc (filter by `stop_reason` to skip streaming partials, last main-chain entry for context length) — used only when Claude Code does not provide the native `context_window` field.
+- Strips PAI-specific bits (Workflows, Algorithm, Learning, Quote, Banner, …) and adds Claude-Code-specific signals: EFFORT, PERM, SESSION cost / lines / uptime, the QUOTA (5h + 7d) row, PR review state, the conditional TASKS line, and per-project claude-mem `obs`. Prefers Claude Code's native stdin fields (`context_window`, `cost`, `effort`, `rate_limits`, `pr`) where available.
 
 ## License
 
