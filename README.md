@@ -116,6 +116,8 @@ API response). On API-key accounts / older Claude Code it falls back to the `ccu
 | **Branch / Age / Mod / Sync** | Git branch, age of last commit, count of uncommitted files, ahead/behind upstream. Hidden when not in a git repo. |
 | **PR** | Open pull request for the current branch (`pr.number` + `pr.review_state`): `✓` approved, `✗` changes requested, `●` pending, `◷` draft. Only shown when a PR is open. |
 
+> Inside Warp this row drops PWD / Branch / Mod (Warp shows them natively) and keeps only Age / Sync / PR — see [Warp integration](#warp-integration).
+
 ### Row 7 — MEMORY
 
 | Field | Meaning |
@@ -270,6 +272,44 @@ fill more of the row), tune it via the `IMPERSL_WIDTH_MARGIN` environment variab
   }
 }
 ```
+
+## Warp integration
+
+[Warp](https://www.warp.dev/) already shows the working-directory path, the git branch,
+and the modified-file / line-diff counts in its own native bottom bar. To avoid showing
+the same thing twice, when the status line detects it is running inside Warp it **drops
+the fields that would duplicate Warp's bar**:
+
+| Field | Outside Warp | Inside Warp |
+|---|---|---|
+| Whole git row (`◆ PWD │ Branch │ Age │ Mod │ Sync │ PR`) | shown | **hidden entirely** |
+| Lines +/- (SESSION row) | shown | dropped (collides with Warp's `+N -M`) |
+
+So inside Warp the `◆ PWD …` row disappears completely, and the SESSION row drops its
+`Lines +/-` segment (leaving `Cost │ Uptime`). Everything Warp does *not* show
+(context, tokens, quota, memory, …) stays.
+
+- **Detection:** Warp exports `TERM_PROGRAM=WarpTerminal`, which the status-line
+  subprocess inherits.
+- **Override:** set `IMPERSL_DEDUP_WARP` in the `statusLine` command — `0` always shows
+  the full layout (even in Warp), `1` forces the compact layout (even outside Warp).
+
+> Trade-off: hiding the whole git row also hides **Age / Sync / PR**, which Warp does
+> *not* show natively. If you want those back, use `IMPERSL_DEDUP_WARP=0`.
+
+```jsonc
+{
+  "statusLine": {
+    "type": "command",
+    "command": "IMPERSL_DEDUP_WARP=0 bash $HOME/.claude/imperStatusLine.sh",
+    "padding": 0
+  }
+}
+```
+
+> Note: `Lines +/-` is **session** edit activity (from `cost.*`), technically different
+> from Warp's `+N -M` working-tree git diff — but since the two collide visually, the
+> Warp layout drops it. Use `IMPERSL_DEDUP_WARP=0` if you want it back.
 
 ## Compatibility
 

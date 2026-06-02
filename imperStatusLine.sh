@@ -5,7 +5,7 @@
 # Standalone, no PAI dependencies. Adds effort, cost, cmd count, and task tracking.
 #
 # ─── Layout ───────────────────────────────────────────────────────────────────
-#   ─ imperStatusLine ─ skill: <output_style>
+#   ─ imperStatusLine ─ style: <output_style>   (or  agent: <name>  in --agent)
 #   TIME │ MODEL │ EFFORT │ PERM
 #   ENV  │ Agents │ SK │ Hooks │ Plugins │ CMD
 #   ──────────────────────────────────
@@ -16,6 +16,8 @@
 #   📊 QUOTA:   5h % ↺reset │ 7d % ↺reset
 #   ──────────────────────────────────
 #   ◆ PWD │ Branch │ Age │ Mod │ Sync │ PR   (or "(not a git repo)")
+#       └─ hidden entirely inside Warp (its native bottom bar already shows cwd,
+#          branch and working-tree changes); the SESSION row also drops Lines +/-.
 #   ──────────────────────────────────
 #   ◎ MEMORY: Sessions │ claude-mem │ CC version
 #   ──────────────────────────────────
@@ -187,6 +189,7 @@ RL_7D_PCT="$(j '.rate_limits.seven_day.used_percentage // empty')"
 RL_7D_RESET="$(j '.rate_limits.seven_day.resets_at // empty')"
 PR_NUM="$(j '.pr.number // empty')"
 PR_STATE="$(j '.pr.review_state // empty')"
+AGENT_NAME="$(j '.agent.name // empty')"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # COUNTS — skills, hooks, commands, plugins (cached, mtime-based)
@@ -574,7 +577,14 @@ NOW=$(date '+%H:%M')
 COST_FMT=$(printf '$%.2f' "$COST_USD" 2>/dev/null || echo "\$0.00")
 SHORT_CWD="${CWD##*/}"
 [ -z "$SHORT_CWD" ] && SHORT_CWD="~"
-ACTIVE_SKILL="${OUTPUT_STYLE}"
+# Header right-hand label: the status line JSON does NOT expose the active skill,
+# so we show the next-most-useful thing — the agent name in an `--agent` session
+# (.agent.name), otherwise the current output style (.output_style.name).
+if [ -n "$AGENT_NAME" ]; then
+    STYLE_LABEL="agent"; STYLE_VALUE="$AGENT_NAME"
+else
+    STYLE_LABEL="style"; STYLE_VALUE="$OUTPUT_STYLE"
+fi
 
 # Friendly model label
 case "$MODEL_ID" in
@@ -603,6 +613,15 @@ fi
 # exceeds_200k flag → a red "⚠200k" marker on the CONTEXT line (relevant on 1M models)
 EXCEEDS_MARK=""
 [ "$EXCEEDS_200K" = "true" ] && EXCEEDS_MARK=" ⚠200k"
+
+# Warp deduplication. Warp shows the cwd path, git branch, and working-tree
+# changes (files + line diff) in its own native bottom bar, so when we detect Warp
+# we drop the fields that would duplicate it: PWD / Branch / Mod on the git row AND
+# the Lines +/- segment on the SESSION row. Detection: TERM_PROGRAM=WarpTerminal.
+# Override via IMPERSL_DEDUP_WARP (0 = never dedup, 1 = always dedup).
+DEDUP=0
+[ "$TERM_PROGRAM" = "WarpTerminal" ] && DEDUP=1
+case "${IMPERSL_DEDUP_WARP:-}" in 0) DEDUP=0 ;; 1) DEDUP=1 ;; esac
 
 # PR review state → symbol + color (shown on the PWD/git row when a PR is open)
 PR_SYM=""; PR_COLOR="$C_VALUE_DIM"
@@ -634,7 +653,7 @@ printf '%b─%b %bimper%bStatus%bLine%b %b─%b ' \
     "$C_LINE" "$R" \
     "$C_TITLE_1$B" "$C_TITLE_2$B" "$C_TITLE_3$B" "$R" \
     "$C_LINE" "$R"
-printf '%bskill: %b%s%b\n' "$C_VALUE_DIM" "$C_PURPLE" "$ACTIVE_SKILL" "$R"
+printf '%b%s: %b%s%b\n' "$C_VALUE_DIM" "$STYLE_LABEL" "$C_PURPLE" "$STYLE_VALUE" "$R"
 
 # Row 1: time | model | effort | perm  (cost moved to SESSION row)
 printf '%bTIME:%b %s   %b│%b   %bMODEL:%b %b%s%b   %b│%b   %bEFFORT:%b %b%s%b   %b│%b   %bPERM:%b %b%s%b\n' \
@@ -686,11 +705,14 @@ if [ "$SES_TOTAL" -gt 0 ]; then
         "$C_SEP" "$R" "$C_VALUE" "$(fmt_n "$SES_TOTAL")" "$R"
 
     # Row 3c: SESSION meta — cost, lines changed (native), uptime.
-    # The 5h/7d reset moved to the dedicated QUOTA row below.
-    printf '%b💰 SESSION:%b Cost %b%s%b   %b│%b   Lines %b+%s%b/%b-%s%b   %b│%b   Uptime %b%s%b\n' \
-        "$C_LABEL" "$R" \
-        "$C_GREEN" "$COST_FMT" "$R" \
-        "$C_SEP" "$R" "$C_GREEN" "${LINES_ADD:-0}" "$R" "$C_RED" "${LINES_DEL:-0}" "$R" \
+    # The 5h/7d reset moved to the dedicated QUOTA row below. In Warp we drop the
+    # Lines +/- segment: it visually collides with Warp's native working-tree diff.
+    printf '%b💰 SESSION:%b Cost %b%s%b' "$C_LABEL" "$R" "$C_GREEN" "$COST_FMT" "$R"
+    if [ "$DEDUP" -eq 0 ]; then
+        printf '   %b│%b   Lines %b+%s%b/%b-%s%b' \
+            "$C_SEP" "$R" "$C_GREEN" "${LINES_ADD:-0}" "$R" "$C_RED" "${LINES_DEL:-0}" "$R"
+    fi
+    printf '   %b│%b   Uptime %b%s%b\n' \
         "$C_SEP" "$R" "$C_VALUE" "$(fmt_uptime "$SES_UPTIME_MIN")" "$R"
     sep
 fi
@@ -709,25 +731,28 @@ if [ "$USAGE_5H_PCT" != "--" ]; then
     sep
 fi
 
-# Row 5: PWD + git
-printf '%b◆ PWD:%b %b%s%b' "$C_LABEL" "$R" "$C_VALUE" "$SHORT_CWD" "$R"
-if [ -n "$GIT_BRANCH" ]; then
-    printf '   %b│%b   %bBranch:%b %b%s%b' "$C_SEP" "$R" "$C_LABEL" "$R" "$C_VALUE" "$GIT_BRANCH" "$R"
-    [ -n "$GIT_AGE" ]  && printf '   %b│%b   %bAge:%b %s' "$C_SEP" "$R" "$C_LABEL" "$R" "$GIT_AGE"
-    if [ "${GIT_MOD:-0}" -gt 0 ]; then
-        printf '   %b│%b   %bMod:%b %b%s%b' "$C_SEP" "$R" "$C_LABEL" "$R" "$C_YELLOW" "$GIT_MOD" "$R"
+# Row 5: PWD + git. In Warp (DEDUP=1, set above) the entire row is suppressed —
+# Warp's native bottom bar already shows the cwd path, branch and working-tree
+# changes, so the whole "◆ PWD … git …" row would be redundant.
+if [ "$DEDUP" -eq 0 ]; then
+    printf '%b◆ PWD:%b %b%s%b' "$C_LABEL" "$R" "$C_VALUE" "$SHORT_CWD" "$R"
+    if [ -n "$GIT_BRANCH" ]; then
+        printf '   %b│%b   %bBranch:%b %b%s%b' "$C_SEP" "$R" "$C_LABEL" "$R" "$C_VALUE" "$GIT_BRANCH" "$R"
+        [ -n "$GIT_AGE" ]  && printf '   %b│%b   %bAge:%b %s' "$C_SEP" "$R" "$C_LABEL" "$R" "$GIT_AGE"
+        if [ "${GIT_MOD:-0}" -gt 0 ]; then
+            printf '   %b│%b   %bMod:%b %b%s%b' "$C_SEP" "$R" "$C_LABEL" "$R" "$C_YELLOW" "$GIT_MOD" "$R"
+        fi
+        [ -n "$GIT_SYNC" ] && [ "$GIT_SYNC" != "=" ] && printf '   %b│%b   %bSync:%b %b%s%b' "$C_SEP" "$R" "$C_LABEL" "$R" "$C_PINK" "$GIT_SYNC" "$R"
+        # PR for the current branch (native .pr — only present when one is open)
+        if [ -n "$PR_NUM" ]; then
+            printf '   %b│%b   %bPR:%b %b#%s %s%b' "$C_SEP" "$R" "$C_LABEL" "$R" "$PR_COLOR" "$PR_NUM" "$PR_SYM" "$R"
+        fi
+    else
+        printf '   %b(not a git repo)%b' "$C_VALUE_DIM" "$R"
     fi
-    [ -n "$GIT_SYNC" ] && [ "$GIT_SYNC" != "=" ] && printf '   %b│%b   %bSync:%b %b%s%b' "$C_SEP" "$R" "$C_LABEL" "$R" "$C_PINK" "$GIT_SYNC" "$R"
-    # PR for the current branch (native .pr — only present when one is open)
-    if [ -n "$PR_NUM" ]; then
-        printf '   %b│%b   %bPR:%b %b#%s %s%b' "$C_SEP" "$R" "$C_LABEL" "$R" "$PR_COLOR" "$PR_NUM" "$PR_SYM" "$R"
-    fi
-else
-    printf '   %b(not a git repo)%b' "$C_VALUE_DIM" "$R"
+    printf '\n'
+    sep
 fi
-printf '\n'
-
-sep
 
 # Row 6: MEMORY. Agents lives in the ENV row now (alongside SK/Hooks/Plugins/CMD);
 # the CC version takes its slot here so the row keeps three balanced columns.
