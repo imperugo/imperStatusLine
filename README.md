@@ -177,6 +177,52 @@ jq '.statusLine = {"type":"command","command":"bash $HOME/.claude/imperStatusLin
 
 Then open (or send any message in) Claude Code — the new status line shows up at the next refresh.
 
+### Option C — Windows (PowerShell)
+
+On Windows the script runs through the bash that Claude Code bundles (Git Bash /
+cygwin), so **no WSL is required**. You need:
+
+- **Claude Code** for Windows with **Git for Windows** installed (it provides `bash`).
+  Check with `git --version`; if missing, grab it from <https://git-scm.com/download/win>.
+- **`jq`** — install it once:
+  ```powershell
+  winget install jqlang.jq
+  ```
+
+> **Why jq needs a moment of care on Windows:** Claude Code's bundled bash does
+> **not** inherit the Windows `PATH`, so a winget-installed `jq` can be invisible
+> to the script (every field would render empty/`0`). The script auto-detects a
+> winget `jq`, but the most reliable option is to drop a `jq.exe` next to the
+> script — see step 2.
+
+Run these from PowerShell:
+
+```powershell
+# 1. Download the script into ~/.claude
+$claude = "$env:USERPROFILE\.claude"
+New-Item -ItemType Directory -Force $claude | Out-Null
+curl.exe -sL https://raw.githubusercontent.com/imperugo/imperStatusLine/main/imperStatusLine.sh `
+  -o "$claude\imperStatusLine.sh"
+
+# 2. (Recommended) copy jq.exe next to the script so it's always found
+$jq = (Get-Command jq -ErrorAction SilentlyContinue).Source
+if ($jq) { Copy-Item $jq "$claude\jq.exe" -Force }
+
+# 3. Add the statusLine entry to settings.json (preserving existing settings)
+$settingsPath = "$claude\settings.json"
+$settings = if (Test-Path $settingsPath) {
+  Copy-Item $settingsPath "$settingsPath.bak" -Force
+  Get-Content $settingsPath -Raw | ConvertFrom-Json
+} else { [PSCustomObject]@{} }
+$ht = @{}
+$settings.PSObject.Properties | ForEach-Object { $ht[$_.Name] = $_.Value }
+$ht["statusLine"] = @{ type = "command"; command = 'bash $HOME/.claude/imperStatusLine.sh'; padding = 0 }
+$ht | ConvertTo-Json -Depth 20 | Set-Content $settingsPath -Encoding utf8
+```
+
+Then **restart Claude Code**. (Restarting also lets a freshly winget-installed
+`jq` propagate, though step 2 makes that unnecessary.)
+
 ## Updating
 
 ### With install.sh
@@ -304,9 +350,14 @@ So inside Warp the `◆ PWD …` row disappears completely, and the SESSION row 
 
 - ✅ macOS (tested on Darwin 25.x)
 - ✅ Linux (uses portable POSIX subset; no GNU-only utilities)
-- ⚠️ Windows / WSL — should work under WSL bash; native Windows untested
+- ✅ Windows (native, via Claude Code's bundled Git Bash) — tested on Windows 11
+- ✅ Windows / WSL — works under WSL bash
 
 The script avoids macOS-vs-Linux pitfalls (no `tac`, no `timeout`, no GNU-only `find` extensions, both BSD and GNU `date` formats supported).
+
+> **Windows note:** install `jq` (e.g. `winget install jqlang.jq`). Claude Code's
+> bundled bash does not inherit the Windows `PATH`, so the script auto-detects a
+> winget-installed `jq` (or a `jq.exe` placed next to the script / in `~/.claude`).
 
 ## Credits
 

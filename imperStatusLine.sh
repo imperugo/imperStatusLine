@@ -60,6 +60,27 @@
 set -o pipefail
 
 # ─────────────────────────────────────────────────────────────────────────────
+# WINDOWS: make `jq` findable. On Windows, Claude Code runs this script through a
+# bundled bash (Git Bash / cygwin) that does NOT inherit the Windows PATH, so a
+# jq installed via winget is invisible — every field then renders empty/0. When
+# jq isn't already on PATH, probe the usual locations (the script's own dir,
+# ~/.claude, and the winget install paths) and prepend the first hit. The globs
+# simply fail to match on macOS/Linux, so this is a no-op there.
+# ─────────────────────────────────────────────────────────────────────────────
+if ! command -v jq >/dev/null 2>&1; then
+    _sl_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+    _la="${LOCALAPPDATA:-$HOME/AppData/Local}"
+    for _d in "$_sl_dir" "$HOME/.claude" "$HOME/.claude/bin" \
+              "$_la/Microsoft/WinGet/Links" \
+              "$_la"/Microsoft/WinGet/Packages/jqlang.jq_*; do
+        if [ -x "$_d/jq.exe" ] || [ -x "$_d/jq" ]; then
+            PATH="$_d:$PATH"; break
+        fi
+    done
+    unset _sl_dir _la _d
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CACHE PATHS
 # ─────────────────────────────────────────────────────────────────────────────
 USER_TAG="${USER:-anon}"
@@ -202,7 +223,10 @@ needs_refresh() {
     local cache="$1" ttl="$2"
     [ ! -f "$cache" ] && return 0
     local age
-    age=$(( $(date +%s) - $(stat -f %m "$cache" 2>/dev/null || stat -c %Y "$cache" 2>/dev/null || echo 0) ))
+    # GNU stat (`-c %Y`, Linux/Git-Bash/cygwin) first, BSD stat (`-f %m`, macOS)
+    # as fallback. The old BSD-first order broke on Windows: GNU's `-f` means
+    # --file-system and prints a multi-line dump that poisons the arithmetic.
+    age=$(( $(date +%s) - $(stat -c %Y "$cache" 2>/dev/null || stat -f %m "$cache" 2>/dev/null || echo 0) ))
     [ "$age" -gt "$ttl" ]
 }
 
