@@ -304,9 +304,14 @@ So inside Warp the `◆ PWD …` row disappears completely, and the SESSION row 
 
 - ✅ macOS (tested on Darwin 25.x)
 - ✅ Linux (uses portable POSIX subset; no GNU-only utilities)
-- ⚠️ Windows / WSL — should work under WSL bash; native Windows untested
+- ✅ Windows (native, via Claude Code's bundled Git Bash) — tested on Windows 11
+- ✅ Windows / WSL — works under WSL bash
 
 The script avoids macOS-vs-Linux pitfalls (no `tac`, no `timeout`, no GNU-only `find` extensions, both BSD and GNU `date` formats supported).
+
+> **Windows note:** install `jq` (e.g. `winget install jqlang.jq`). Claude Code's
+> bundled bash does not inherit the Windows `PATH`, so the script auto-detects a
+> winget-installed `jq` (or a `jq.exe` placed next to the script / in `~/.claude`).
 
 ## Credits
 
