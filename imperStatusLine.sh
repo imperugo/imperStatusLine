@@ -44,7 +44,6 @@
 #
 # ─── Optional dependencies ────────────────────────────────────────────────────
 #   - jq          (required) — JSON parsing
-#   - sqlite3     (optional) — counts claude-mem observations
 #   - npx + ccusage (optional) — FALLBACK for the 5h quota only when CC does not
 #                                provide rate_limits natively; first run ~30s in
 #                                background, then cached
