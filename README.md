@@ -4,6 +4,14 @@ A custom status line for [Claude Code](https://docs.claude.com/en/docs/claude-co
 
 ![imperStatusLine screenshot](./screenshot.png)
 
+> **Why bother with a status line?** Because the context window is what quietly
+> degrades a long session, and nothing warns you when it starts: model quality
+> slips well before the window is full, and the answers keep the same confident
+> tone the whole way down. The bar exists so you can decide to hand off *before*
+> you need to, instead of finding out afterwards. The research behind that — and
+> what to do about it — is in
+> [**Context is a budget**](https://ugolattanzi.com/en/blog/context-is-a-budget/).
+
 ## What you see
 
 ```
@@ -364,6 +372,10 @@ The script avoids macOS-vs-Linux pitfalls (no `tac`, no `timeout`, no GNU-only `
 - Layout, color palette, and "render-as-block-with-separators" approach borrowed from [PAI v5.0.0](https://github.com/danielmiessler/Personal_AI_Infrastructure) by Daniel Miessler — credit where credit is due.
 - Token-aggregation **fallback** methodology aligned with [ccstatusline](https://github.com/sirmalloc/ccstatusline) by sirmalloc (filter by `stop_reason` to skip streaming partials, last main-chain entry for context length) — used only when Claude Code does not provide the native `context_window` field.
 - Strips PAI-specific bits (Workflows, Algorithm, Learning, Quote, Banner, …) and adds Claude-Code-specific signals: EFFORT, PERM, SESSION cost / lines / uptime, the QUOTA (5h + 7d) row, PR review state, and the conditional TASKS line. Prefers Claude Code's native stdin fields (`context_window`, `cost`, `effort`, `rate_limits`, `pr`) where available, and deduplicates against Warp's native bottom bar.
+
+## Further reading
+
+- [**Context is a budget**](https://ugolattanzi.com/en/blog/context-is-a-budget/) — why long sessions get worse without telling you, what the research measures, and why a handoff beats a compaction. This tool is the instrument that article argues for. Also in [italiano](https://ugolattanzi.com/it/blog/il-contesto-e-un-budget/) and [Deutsch](https://ugolattanzi.com/de/blog/kontext-ist-ein-budget/).
 
 ## License
 
